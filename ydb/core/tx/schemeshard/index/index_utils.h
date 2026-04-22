@@ -117,6 +117,16 @@ NKikimrSchemeOp::TTableDescription CalcFulltextDictImplTableDesc(
     const NKikimrSchemeOp::TTableDescription& indexTableDesc,
     const NKikimrSchemeOp::TFulltextIndexDescription& indexDesc);
 
+NKikimrSchemeOp::TTableDescription CalcFulltextPostingImplTableDesc(
+    const NSchemeShard::TTableInfo::TPtr& baseTableInfo,
+    const NKikimrSchemeOp::TPartitionConfig& baseTablePartitionConfig,
+    const NKikimrSchemeOp::TTableDescription& indexTableDesc);
+
+NKikimrSchemeOp::TTableDescription CalcFulltextPostingImplTableDesc(
+    const NKikimrSchemeOp::TTableDescription& baseTableDescr,
+    const NKikimrSchemeOp::TPartitionConfig& baseTablePartitionConfig,
+    const NKikimrSchemeOp::TTableDescription& indexTableDesc);
+
 NKikimrSchemeOp::TTableDescription CalcFulltextStatsImplTableDesc(
     const NSchemeShard::TTableInfo::TPtr& baseTableInfo,
     const NKikimrSchemeOp::TPartitionConfig& baseTablePartitionConfig,

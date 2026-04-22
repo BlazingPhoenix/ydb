@@ -375,12 +375,13 @@ TVector<ISubOperation::TPtr> CreateIndexedTable(TOperationId nextId, const TTxTr
                 break;
             }
             case NKikimrSchemeOp::EIndexTypeGlobalFulltextRelevance: {
-                NKikimrSchemeOp::TTableDescription userIndexDesc, docsTableDesc, dictTableDesc, statsTableDesc;
-                if (indexDescription.IndexImplTableDescriptionsSize() == 4) {
+                NKikimrSchemeOp::TTableDescription userIndexDesc, docsTableDesc, dictTableDesc, statsTableDesc, lsmPostingTableDesc;
+                if (indexDescription.IndexImplTableDescriptionsSize() == 5) {
                     dictTableDesc = indexDescription.GetIndexImplTableDescriptions(NTableIndex::NFulltext::DictTablePosition);
                     docsTableDesc = indexDescription.GetIndexImplTableDescriptions(NTableIndex::NFulltext::DocsTablePosition);
                     statsTableDesc = indexDescription.GetIndexImplTableDescriptions(NTableIndex::NFulltext::StatsTablePosition);
                     userIndexDesc = indexDescription.GetIndexImplTableDescriptions(NTableIndex::NFulltext::PostingTablePosition);
+                    lsmPostingTableDesc = indexDescription.GetIndexImplTableDescriptions(NTableIndex::NFulltext::LsmPostingTablePosition);
                 }
                 const THashSet<TString> indexDataColumns{indexDescription.GetDataColumnNames().begin(), indexDescription.GetDataColumnNames().end()};
                 result.push_back(createIndexImplTable(CalcFulltextImplTableDesc(baseTableDescription, baseTableDescription.GetPartitionConfig(),
@@ -388,6 +389,7 @@ TVector<ISubOperation::TPtr> CreateIndexedTable(TOperationId nextId, const TTxTr
                 result.push_back(createIndexImplTable(CalcFulltextDocsImplTableDesc(baseTableDescription, baseTableDescription.GetPartitionConfig(), indexDataColumns, docsTableDesc)));
                 result.push_back(createIndexImplTable(CalcFulltextDictImplTableDesc(baseTableDescription, baseTableDescription.GetPartitionConfig(), dictTableDesc, indexDescription.GetFulltextIndexDescription())));
                 result.push_back(createIndexImplTable(CalcFulltextStatsImplTableDesc(baseTableDescription, baseTableDescription.GetPartitionConfig(), statsTableDesc)));
+                result.push_back(createIndexImplTable(CalcFulltextPostingImplTableDesc(baseTableDescription, baseTableDescription.GetPartitionConfig(), lsmPostingTableDesc)));
                 break;
             }
             default:

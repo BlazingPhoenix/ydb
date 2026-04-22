@@ -241,12 +241,13 @@ TVector<ISubOperation::TPtr> CreateBuildIndex(TOperationId opId, const TTxTransa
             break;
         }
         case NKikimrSchemeOp::EIndexTypeGlobalFulltextRelevance: {
-            NKikimrSchemeOp::TTableDescription indexTableDesc, docsTableDesc, dictTableDesc, statsTableDesc;
-            if (indexDesc.IndexImplTableDescriptionsSize() == 4) {
+            NKikimrSchemeOp::TTableDescription indexTableDesc, docsTableDesc, dictTableDesc, statsTableDesc, lsmPostingTableDesc;
+            if (indexDesc.IndexImplTableDescriptionsSize() == 5) {
                 dictTableDesc = indexDesc.GetIndexImplTableDescriptions(NTableIndex::NFulltext::DictTablePosition);
                 docsTableDesc = indexDesc.GetIndexImplTableDescriptions(NTableIndex::NFulltext::DocsTablePosition);
                 statsTableDesc = indexDesc.GetIndexImplTableDescriptions(NTableIndex::NFulltext::StatsTablePosition);
                 indexTableDesc = indexDesc.GetIndexImplTableDescriptions(NTableIndex::NFulltext::PostingTablePosition);
+                lsmPostingTableDesc = indexDesc.GetIndexImplTableDescriptions(NTableIndex::NFulltext::LsmPostingTablePosition);
             }
             const THashSet<TString> indexDataColumns{indexDesc.GetDataColumnNames().begin(), indexDesc.GetDataColumnNames().end()};
             auto implTableDesc = CalcFulltextImplTableDesc(tableInfo, tableInfo->PartitionConfig(), indexDataColumns,
@@ -256,6 +257,7 @@ TVector<ISubOperation::TPtr> CreateBuildIndex(TOperationId opId, const TTxTransa
             result.push_back(createImplTable(CalcFulltextDocsImplTableDesc(tableInfo, tableInfo->PartitionConfig(), indexDataColumns, docsTableDesc)));
             result.push_back(createImplTable(CalcFulltextDictImplTableDesc(tableInfo, tableInfo->PartitionConfig(), dictTableDesc, indexDesc.GetFulltextIndexDescription())));
             result.push_back(createImplTable(CalcFulltextStatsImplTableDesc(tableInfo, tableInfo->PartitionConfig(), statsTableDesc)));
+            result.push_back(createImplTable(CalcFulltextPostingImplTableDesc(tableInfo, tableInfo->PartitionConfig(), lsmPostingTableDesc)));
             break;
         }
         default:

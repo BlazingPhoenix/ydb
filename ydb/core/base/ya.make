@@ -51,6 +51,12 @@ SRCS(
     path.cpp
     pool_stats_collector.cpp
     pool_stats_collector.h
+    posting_list.cpp
+    posting_list.h
+    posting_list_merge.cpp
+    posting_list_merge.h
+    posting_list_iterator.cpp
+    posting_list_iterator.h
     resource_profile.h
     row_version.cpp
     row_version.h

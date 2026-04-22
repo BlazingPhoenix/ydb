@@ -30,7 +30,7 @@ TIndexObjectCounts GetIndexObjectCounts(const NKikimrSchemeOp::TIndexCreationCon
             break;
         }
         case NKikimrSchemeOp::EIndexTypeGlobalFulltextRelevance: {
-            res.IndexTableCount = 4;
+            res.IndexTableCount = 5;
             break;
         }
         default:
@@ -540,6 +540,52 @@ auto CalcFulltextDictImplTableDescImpl(
     return implTableDesc;
 }
 
+auto CalcFulltextPostingImplTableDescImpl(
+    const auto& baseTable,
+    const NKikimrSchemeOp::TPartitionConfig& baseTablePartitionConfig,
+    const NKikimrSchemeOp::TTableDescription& indexTableDesc)
+{
+    Y_UNUSED(baseTable);
+
+    NKikimrSchemeOp::TTableDescription implTableDesc;
+    implTableDesc.SetName(NTableIndex::NFulltext::PostingTable);
+    SetImplTablePartitionConfig(baseTablePartitionConfig, indexTableDesc, implTableDesc);
+    {
+        auto col = implTableDesc.AddColumns();
+        col->SetName(NFulltext::WordIdColumn);
+        col->SetType(NFulltext::WordIdTypeName);
+        col->SetTypeId(NFulltext::WordIdType);
+        col->SetNotNull(true);
+    }
+    {
+        auto col = implTableDesc.AddColumns();
+        col->SetName(NFulltext::DocIdColumn);
+        col->SetType(NFulltext::DocIdTypeName);
+        col->SetTypeId(NFulltext::DocIdType);
+        col->SetNotNull(true);
+    }
+    {
+        auto col = implTableDesc.AddColumns();
+        col->SetName(NFulltext::FreqColumn);
+        col->SetType(NFulltext::TokenCountTypeName);
+        col->SetTypeId(NFulltext::TokenCountType);
+        col->SetNotNull(true);
+    }
+    {
+        auto col = implTableDesc.AddColumns();
+        col->SetName(NFulltext::PositionsColumn);
+        col->SetType("String");
+        col->SetTypeId(NScheme::NTypeIds::String);
+        col->SetNotNull(false);
+    }
+    implTableDesc.AddKeyColumnNames(NFulltext::WordIdColumn);
+    implTableDesc.AddKeyColumnNames(NFulltext::DocIdColumn);
+
+    implTableDesc.SetSystemColumnNamesAllowed(true);
+
+    return implTableDesc;
+}
+
 auto CalcFulltextStatsImplTableDescImpl(
     const auto& baseTable,
     const NKikimrSchemeOp::TPartitionConfig& baseTablePartitionConfig,
@@ -753,6 +799,22 @@ NKikimrSchemeOp::TTableDescription CalcFulltextDictImplTableDesc(
     const NKikimrSchemeOp::TFulltextIndexDescription& indexDesc)
 {
     return CalcFulltextDictImplTableDescImpl(baseTableDescr, baseTablePartitionConfig, indexTableDesc, indexDesc);
+}
+
+NKikimrSchemeOp::TTableDescription CalcFulltextPostingImplTableDesc(
+    const NSchemeShard::TTableInfo::TPtr& baseTableInfo,
+    const NKikimrSchemeOp::TPartitionConfig& baseTablePartitionConfig,
+    const NKikimrSchemeOp::TTableDescription& indexTableDesc)
+{
+    return CalcFulltextPostingImplTableDescImpl(baseTableInfo, baseTablePartitionConfig, indexTableDesc);
+}
+
+NKikimrSchemeOp::TTableDescription CalcFulltextPostingImplTableDesc(
+    const NKikimrSchemeOp::TTableDescription& baseTableDescr,
+    const NKikimrSchemeOp::TPartitionConfig& baseTablePartitionConfig,
+    const NKikimrSchemeOp::TTableDescription& indexTableDesc)
+{
+    return CalcFulltextPostingImplTableDescImpl(baseTableDescr, baseTablePartitionConfig, indexTableDesc);
 }
 
 NKikimrSchemeOp::TTableDescription CalcFulltextStatsImplTableDesc(

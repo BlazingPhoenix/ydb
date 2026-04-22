@@ -1203,6 +1203,7 @@ private:
         };
         if (buildInfo.IndexType == NKikimrSchemeOp::EIndexType::EIndexTypeGlobalFulltextRelevance) {
             ev->Record.SetIndexType(NKikimrTxDataShard::EFulltextIndexType::FulltextRelevance);
+            ev->Record.SetPostingTableName(GetBuildPath(Self, buildInfo, NTableIndex::NFulltext::PostingTable).PathString());
         } else if (buildInfo.IndexType == NKikimrSchemeOp::EIndexType::EIndexTypeGlobalJson) {
             ev->Record.SetIndexType(NKikimrTxDataShard::EFulltextIndexType::Json);
         }

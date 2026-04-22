@@ -1944,6 +1944,9 @@ enum EFulltextIndexType {
     FulltextPlain = 0;
     FulltextRelevance = 1;
     Json = 2;
+    PostingBasic = 10;       // basic inverted index (word_id, doc_id)
+    PostingWeighted = 11;    // with freq
+    PostingPositional = 12;  // with freq + positions
 }
 
 message TEvBuildFulltextIndexRequest {
@@ -1972,6 +1975,8 @@ message TEvBuildFulltextIndexRequest {
     optional EFulltextIndexType IndexType = 14;
 
     optional NKikimrTx.TKeyRange KeyRange = 15;
+
+    optional string PostingTableName = 16;
 }
 
 message TEvBuildFulltextIndexResponse {

@@ -9,7 +9,10 @@
 #include <ydb/core/base/counters.h>
 #include <ydb/core/base/fulltext.h>
 #include <ydb/core/base/json_index.h>
+#include <ydb/core/base/posting_list.h>
 #include <ydb/core/scheme/scheme_tablecell.h>
+
+#include <util/digest/city.h>
 
 #include <ydb/core/tx/tx_proxy/proxy.h>
 #include <ydb/core/tx/tx_proxy/upload_rows.h>
@@ -433,6 +436,386 @@ protected:
     }
 };
 
+/*
+ * TBuildPostingIndexScan scans the source document table and writes (word_id, doc_id) posting entries
+ * to the posting table using an LSM-style posting index layout.
+ *
+ * Output schema depends on EFulltextIndexType:
+ *   PostingBasic:      (__ydb_word_id: Uint32, __ydb_doc_id: Uint64)
+ *   PostingWeighted:   (__ydb_word_id: Uint32, __ydb_doc_id: Uint64, __ydb_freq: Uint32)
+ *   PostingPositional: (__ydb_word_id: Uint32, __ydb_doc_id: Uint64, __ydb_freq: Uint32, __ydb_positions: String)
+ *
+ * word_id is computed as CityHash64(token) truncated to ui32.
+ * doc_id is computed as CityHash64 of the serialized primary key cells.
+ */
+
+class TBuildPostingIndexScan: public TActor<TBuildPostingIndexScan>, public IActorExceptionHandler, public NTable::IScan {
+    IDriver* Driver = nullptr;
+
+    ui64 TabletId = 0;
+    ui64 BuildId = 0;
+
+    ui64 ReadRows = 0;
+    ui64 ReadBytes = 0;
+    ui64 JsonErrors = 0;
+
+    ui64 DocCount = 0;
+    ui64 TotalDocLength = 0;
+
+    TTags ScanTags;
+    TString TextColumn;
+    Ydb::Table::FulltextIndexSettings::Analyzers TextAnalyzers;
+    bool IsBinaryJson = false;
+
+    NKikimrTxDataShard::EFulltextIndexType IndexType;
+
+    TBatchRowsUploader Uploader;
+    TBufferData* PostingBuf = nullptr;
+
+    TVector<NScheme::TTypeInfo> KeyTypes;
+    TSerializedTableRange RequestedRange;
+    TSerializedTableRange TableRange;
+    TSerializedCellVec LastProcessedKey;
+    TSerializedCellVec LastAckedKey;
+
+    const NKikimrTxDataShard::TEvBuildFulltextIndexRequest Request;
+    const TActorId ResponseActorId;
+    const TAutoPtr<TEvDataShard::TEvBuildFulltextIndexResponse> Response;
+
+public:
+    static constexpr NKikimrServices::TActivity::EType ActorActivityType()
+    {
+        return NKikimrServices::TActivity::BUILD_FULLTEXT_INDEX;
+    }
+
+    TBuildPostingIndexScan(ui64 tabletId, const TUserTable& table, NKikimrTxDataShard::TEvBuildFulltextIndexRequest request,
+        const TActorId& responseActorId, TAutoPtr<TEvDataShard::TEvBuildFulltextIndexResponse>&& response)
+        : TActor{&TThis::StateWork}
+        , TabletId(tabletId)
+        , BuildId{request.GetId()}
+        , IndexType(request.GetIndexType())
+        , Uploader(request.GetDatabaseName(), request.GetScanSettings())
+        , KeyTypes(table.KeyColumnTypes)
+        , TableRange(table.Range)
+        , Request(std::move(request))
+        , ResponseActorId{responseActorId}
+        , Response{std::move(response)}
+    {
+        if (Request.HasKeyRange()) {
+            RequestedRange.Load(Request.GetKeyRange());
+        } else {
+            RequestedRange = TableRange;
+        }
+
+        LOG_I("Create " << Debug());
+
+        Y_ENSURE(Request.settings().columns().size() == 1);
+        TextColumn = Request.settings().columns().at(0).column();
+        TextAnalyzers = Request.settings().columns().at(0).analyzers();
+
+        auto tags = GetAllTags(table);
+        auto types = GetAllTypes(table);
+
+        const auto& textType = types.at(TextColumn);
+        if (textType.GetTypeId() == NUdf::TDataType<NUdf::TJsonDocument>::Id) {
+            IsBinaryJson = true;
+        }
+
+        {
+            ScanTags.push_back(tags.at(TextColumn));
+        }
+
+        // Build upload types for the posting table
+        {
+            auto uploadTypes = std::make_shared<NTxProxy::TUploadTypes>();
+
+            // Key columns: word_id, doc_id
+            {
+                Ydb::Type type;
+                type.set_type_id(WordIdType);
+                uploadTypes->emplace_back(WordIdColumn, type);
+            }
+            {
+                Ydb::Type type;
+                type.set_type_id(DocIdType);
+                uploadTypes->emplace_back(DocIdColumn, type);
+            }
+
+            // Value columns depend on index type
+            if (IndexType == NKikimrTxDataShard::EFulltextIndexType::PostingWeighted ||
+                IndexType == NKikimrTxDataShard::EFulltextIndexType::PostingPositional) {
+                Ydb::Type type;
+                type.set_type_id(TokenCountType);
+                uploadTypes->emplace_back(FreqColumn, type);
+            }
+            if (IndexType == NKikimrTxDataShard::EFulltextIndexType::PostingPositional) {
+                Ydb::Type type;
+                type.set_type_id(Ydb::Type::STRING);
+                uploadTypes->emplace_back(PositionsColumn, type);
+            }
+
+            PostingBuf = Uploader.AddDestination(Request.GetPostingTableName(), std::move(uploadTypes));
+        }
+    }
+
+    TInitialState Prepare(IDriver* driver, TIntrusiveConstPtr<TScheme>) final
+    {
+        TActivationContext::AsActorContext().RegisterWithSameMailbox(this);
+        LOG_I("Prepare " << Debug());
+
+        Driver = driver;
+        Uploader.SetOwner(SelfId());
+
+        return {EScan::Feed, {}};
+    }
+
+    EScan Seek(TLead& lead, ui64 seq) final
+    {
+        LOG_T("Seek " << seq << " " << Debug());
+
+        if (seq) {
+            return Uploader.CanFinish()
+                ? EScan::Final
+                : EScan::Sleep;
+        }
+
+        auto scanRange = Intersect(KeyTypes, RequestedRange.ToTableRange(), TableRange.ToTableRange());
+
+        if (scanRange.From) {
+            auto seek = scanRange.InclusiveFrom ? NTable::ESeek::Lower : NTable::ESeek::Upper;
+            lead.To(ScanTags, scanRange.From, seek);
+        } else {
+            lead.To(ScanTags, {}, NTable::ESeek::Lower);
+        }
+
+        if (scanRange.To) {
+            lead.Until(scanRange.To, scanRange.InclusiveTo);
+        }
+
+        return EScan::Feed;
+    }
+
+    EScan Feed(TArrayRef<const TCell> key, const TRow& row) final
+    {
+        ++ReadRows;
+        ReadBytes += CountRowCellBytes(key, *row);
+
+        LastProcessedKey = TSerializedCellVec(key);
+
+        // Compute doc_id from PK hash
+        TString serializedKey = TSerializedCellVec::Serialize(key);
+        const ui64 docId = CityHash64(serializedKey.data(), serializedKey.size());
+
+        // Tokenize text
+        TVector<TString> tokens;
+        if (IsBinaryJson) {
+            tokens = NJsonIndex::TokenizeBinaryJson(row.Get(0).AsBuf());
+        } else {
+            tokens = Analyze(row.Get(0).AsBuf(), TextAnalyzers);
+        }
+
+        if (IndexType == NKikimrTxDataShard::EFulltextIndexType::PostingBasic) {
+            // Deduplicate tokens
+            THashSet<TString> seen;
+            for (const auto& token : tokens) {
+                if (seen.insert(token).second) {
+                    const ui32 wordId = static_cast<ui32>(CityHash64(token.data(), token.size()));
+
+                    TVector<TCell> uploadKey;
+                    uploadKey.push_back(TCell::Make(wordId));
+                    uploadKey.push_back(TCell::Make(docId));
+
+                    TVector<TCell> uploadValue;
+                    PostingBuf->AddRow(uploadKey, uploadValue);
+                }
+            }
+        } else if (IndexType == NKikimrTxDataShard::EFulltextIndexType::PostingWeighted) {
+            // Count token frequencies
+            THashMap<TString, ui32> tokenFreq;
+            for (const auto& token : tokens) {
+                tokenFreq[token]++;
+            }
+            for (const auto& [token, freq] : tokenFreq) {
+                const ui32 wordId = static_cast<ui32>(CityHash64(token.data(), token.size()));
+
+                TVector<TCell> uploadKey;
+                uploadKey.push_back(TCell::Make(wordId));
+                uploadKey.push_back(TCell::Make(docId));
+
+                TVector<TCell> uploadValue;
+                uploadValue.push_back(TCell::Make(freq));
+
+                PostingBuf->AddRow(uploadKey, uploadValue);
+            }
+        } else {
+            // PostingPositional: count frequencies and collect positions
+            THashMap<TString, TVector<ui32>> tokenPositions;
+            for (ui32 pos = 0; pos < tokens.size(); ++pos) {
+                tokenPositions[tokens[pos]].push_back(pos);
+            }
+            for (const auto& [token, positions] : tokenPositions) {
+                const ui32 wordId = static_cast<ui32>(CityHash64(token.data(), token.size()));
+                const ui32 freq = positions.size();
+
+                // Encode positions as delta+varint blob
+                TString positionsBlob;
+                ui32 prevPos = 0;
+                for (ui32 p : positions) {
+                    NPostingList::EncodeVarint32(p - prevPos, positionsBlob);
+                    prevPos = p;
+                }
+
+                TVector<TCell> uploadKey;
+                uploadKey.push_back(TCell::Make(wordId));
+                uploadKey.push_back(TCell::Make(docId));
+
+                TVector<TCell> uploadValue;
+                uploadValue.push_back(TCell::Make(freq));
+                uploadValue.push_back(TCell(positionsBlob.data(), positionsBlob.size()));
+
+                PostingBuf->AddRow(uploadKey, uploadValue);
+            }
+        }
+
+        ui32 totalTokens = tokens.size();
+        DocCount++;
+        TotalDocLength += totalTokens;
+
+        return Uploader.ShouldWaitUpload() ? EScan::Sleep : EScan::Feed;
+    }
+
+    EScan PageFault() final
+    {
+        LOG_T("PageFault " << Debug());
+        return EScan::Feed;
+    }
+
+    EScan Exhausted() final
+    {
+        if (JsonErrors > 0) {
+            LOG_W("Invalid JSON encountered in " << JsonErrors << " rows " << Debug());
+        }
+        LOG_T("Exhausted " << Debug());
+
+        // call Seek to wait uploads
+        return EScan::Reset;
+    }
+
+    TAutoPtr<IDestructable> Finish(const std::exception& exc) final
+    {
+        Uploader.AddIssue(exc);
+        return Finish(EStatus::Exception);
+    }
+
+    TAutoPtr<IDestructable> Finish(EStatus status) final
+    {
+        auto& record = Response->Record;
+        record.MutableMeteringStats()->SetReadRows(ReadRows);
+        record.MutableMeteringStats()->SetReadBytes(ReadBytes);
+        record.MutableMeteringStats()->SetCpuTimeUs(Driver->GetTotalCpuTimeUs());
+        record.SetDocCount(DocCount);
+        record.SetTotalDocLength(TotalDocLength);
+
+        if (LastAckedKey.GetBuffer()) {
+            record.SetLastKeyAck(LastAckedKey.GetBuffer());
+        }
+
+        Uploader.Finish(record, status);
+
+        if (Response->Record.GetStatus() == NKikimrIndexBuilder::DONE) {
+            LOG_N("Done " << Debug() << " " << Response->Record.ShortDebugString());
+        } else {
+            LOG_E("Failed " << Debug() << " " << Response->Record.ShortDebugString());
+        }
+        Send(ResponseActorId, Response.Release());
+
+        Driver = nullptr;
+        this->PassAway();
+        return nullptr;
+    }
+
+    bool OnUnhandledException(const std::exception& exc) final
+    {
+        if (!Driver) {
+            return false;
+        }
+        Driver->Throw(exc);
+        return true;
+    }
+
+    void Describe(IOutputStream& out) const final
+    {
+        out << Debug();
+    }
+
+protected:
+    STFUNC(StateWork)
+    {
+        switch (ev->GetTypeRewrite()) {
+            HFunc(TEvTxUserProxy::TEvUploadRowsResponse, Handle);
+            CFunc(TEvents::TSystem::Wakeup, HandleWakeup);
+            default:
+                LOG_E("StateWork unexpected event type: " << ev->GetTypeRewrite()
+                    << " event: " << ev->ToString() << " " << Debug());
+        }
+    }
+
+    void HandleWakeup(const NActors::TActorContext& /*ctx*/)
+    {
+        LOG_D("Retry upload " << Debug());
+
+        Uploader.RetryUpload();
+    }
+
+    void Handle(TEvTxUserProxy::TEvUploadRowsResponse::TPtr& ev, const TActorContext& ctx)
+    {
+        LOG_D("Handle TEvUploadRowsResponse " << Debug()
+            << " ev->Sender: " << ev->Sender.ToString());
+
+        if (!Driver) {
+            return;
+        }
+
+        bool batchUploaded = Uploader.Handle(ev);
+
+        if (Uploader.GetUploadStatus().IsSuccess()) {
+            if (batchUploaded && LastProcessedKey.GetBuffer() &&
+                LastProcessedKey.GetBuffer() != LastAckedKey.GetBuffer()) {
+                LastAckedKey = LastProcessedKey;
+
+                auto progress = MakeHolder<TEvDataShard::TEvBuildFulltextIndexResponse>();
+                auto& record = progress->Record;
+                record.SetId(BuildId);
+                record.SetTabletId(TabletId);
+                record.SetRequestSeqNoGeneration(Request.GetSeqNoGeneration());
+                record.SetRequestSeqNoRound(Request.GetSeqNoRound());
+                record.SetStatus(NKikimrIndexBuilder::EBuildStatus::IN_PROGRESS);
+                record.SetLastKeyAck(LastAckedKey.GetBuffer());
+                Send(ResponseActorId, progress.Release());
+            }
+            Driver->Touch(EScan::Feed);
+            return;
+        }
+
+        if (auto retryAfter = Uploader.GetRetryAfter(); retryAfter) {
+            LOG_N("Got retriable error, " << Debug() << " " << Uploader.GetUploadStatus().ToString());
+            ctx.Schedule(*retryAfter, new TEvents::TEvWakeup());
+            return;
+        }
+
+        LOG_N("Got error, abort scan, " << Debug() << " " << Uploader.GetUploadStatus().ToString());
+
+        Driver->Touch(EScan::Final);
+    }
+
+    TString Debug() const
+    {
+        return TStringBuilder() << "TBuildPostingIndexScan TabletId: " << TabletId << " Id: " << BuildId
+            << ", last acked key: " << DebugPrintPoint(KeyTypes, LastAckedKey.GetCells(), *AppData()->TypeRegistry)
+            << " " << Uploader.Debug();
+    }
+};
+
 class TDataShard::TTxHandleSafeBuildFulltextIndexScan final: public NTabletFlatExecutor::TTransactionBase<TDataShard> {
 public:
     TTxHandleSafeBuildFulltextIndexScan(TDataShard* self, TEvDataShard::TEvBuildFulltextIndexRequest::TPtr&& ev)
@@ -570,6 +953,12 @@ void TDataShard::HandleSafe(TEvDataShard::TEvBuildFulltextIndexRequest::TPtr& ev
                 !request.GetDocsTableName()) {
                 badRequest(TStringBuilder() << "Empty index documents table name");
             }
+            if ((request.GetIndexType() == NKikimrTxDataShard::EFulltextIndexType::PostingBasic ||
+                 request.GetIndexType() == NKikimrTxDataShard::EFulltextIndexType::PostingWeighted ||
+                 request.GetIndexType() == NKikimrTxDataShard::EFulltextIndexType::PostingPositional) &&
+                !request.GetPostingTableName()) {
+                badRequest(TStringBuilder() << "Empty posting table name");
+            }
         }
 
         if (trySendBadRequest()) {
@@ -577,8 +966,16 @@ void TDataShard::HandleSafe(TEvDataShard::TEvBuildFulltextIndexRequest::TPtr& ev
         }
 
         // 4. Creating scan
-        TAutoPtr<NTable::IScan> scan = new TBuildFulltextIndexScan(TabletID(), userTable,
-            request, ev->Sender, std::move(response));
+        TAutoPtr<NTable::IScan> scan;
+        if (request.GetIndexType() == NKikimrTxDataShard::EFulltextIndexType::PostingBasic ||
+            request.GetIndexType() == NKikimrTxDataShard::EFulltextIndexType::PostingWeighted ||
+            request.GetIndexType() == NKikimrTxDataShard::EFulltextIndexType::PostingPositional) {
+            scan = new TBuildPostingIndexScan(TabletID(), userTable,
+                request, ev->Sender, std::move(response));
+        } else {
+            scan = new TBuildFulltextIndexScan(TabletID(), userTable,
+                request, ev->Sender, std::move(response));
+        }
 
         StartScan(this, std::move(scan), id, seqNo, rowVersion, userTable.LocalTid);
     } catch (const std::exception& exc) {

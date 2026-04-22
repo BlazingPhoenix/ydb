@@ -131,11 +131,30 @@ namespace NFulltext {
 
     inline constexpr const char* FullTextRelevanceColumn = "__ydb_full_text_relevance";
 
+    // LSM posting table columns
+    inline constexpr const char* WordIdColumn = "__ydb_word_id";
+    inline constexpr const char* DocIdColumn = "__ydb_doc_id";
+    inline constexpr const char* PositionsColumn = "__ydb_positions";
+
+    // LSM posting table name
+    inline constexpr const char* PostingTable = "indexImplPostingTable";
+
+    // Type for word_id
+    using TWordId = ui32;
+    inline constexpr auto WordIdType = Ydb::Type::UINT32;
+    inline constexpr const char* WordIdTypeName = "Uint32";
+
+    // Type for doc_id
+    using TDocId = ui64;
+    inline constexpr auto DocIdType = Ydb::Type::UINT64;
+    inline constexpr const char* DocIdTypeName = "Uint64";
+
     // Impl table positions in partitioning setting list
     inline constexpr const int DictTablePosition = 0;
     inline constexpr const int DocsTablePosition = 1;
     inline constexpr const int StatsTablePosition = 2;
     inline constexpr const int PostingTablePosition = 3;
+    inline constexpr const int LsmPostingTablePosition = 4;
 
     enum class EDefaultOperator {
         Invalid,
