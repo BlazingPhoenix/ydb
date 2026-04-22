@@ -21,6 +21,7 @@ SRCS(
     memory_stats_ut.cpp
     path_ut.cpp
     posting_list_ut.cpp
+    posting_list_iterator_ut.cpp
     state_storage_follower_ids_ut.cpp
     statestorage_guardian_impl_ut.cpp
     statestorage_ut.cpp

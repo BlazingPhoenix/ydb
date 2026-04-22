@@ -36,7 +36,7 @@ TBasicPostingIterator::TBasicPostingIterator(
         if (i < delSkipPointers.size()) {
             skips = std::move(delSkipPointers[i]);
         }
-        DelReaders.emplace_back(delLists[i], type, skips);
+        DelReaders.emplace_back(delLists[i], EPostingListType::Basic, skips);
     }
 
     // Initialize the min-heap: advance each ADD reader once and push to heap
