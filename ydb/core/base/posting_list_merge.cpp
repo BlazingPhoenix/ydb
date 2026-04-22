@@ -48,6 +48,22 @@ void WriteEntry(TPostingListWriter& writer, EPostingListType type,
     }
 }
 
+// Write an entry from a positioned reader, reading freq/positions only when appropriate.
+void WriteEntryFromReader(TPostingListWriter& writer, EPostingListType type,
+                          TPostingListReader& reader) {
+    switch (type) {
+        case EPostingListType::Basic:
+            writer.AddDoc(reader.DocId());
+            break;
+        case EPostingListType::Weighted:
+            writer.AddDoc(reader.DocId(), reader.Freq());
+            break;
+        case EPostingListType::Positional:
+            writer.AddDoc(reader.DocId(), reader.Freq(), reader.Positions());
+            break;
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Helper: populate a TReaderEntry from a positioned reader.
 ////////////////////////////////////////////////////////////////////////////////
@@ -91,7 +107,7 @@ TString MergeAddPostingLists(
         TPostingListWriter writer(type, skipInterval);
         TPostingListReader reader(lists[0], type);
         while (reader.Next()) {
-            WriteEntry(writer, type, reader.DocId(), reader.Freq(), reader.Positions());
+            WriteEntryFromReader(writer, type, reader);
         }
         TString result = writer.Finish();
         outSkipPointers = writer.GetSkipPointers();
@@ -255,7 +271,7 @@ TString SubtractPostingLists(
 
         if (addDocId < delDocId) {
             // ADD entry not in DEL -> keep
-            WriteEntry(addWriter, type, addReader.DocId(), addReader.Freq(), addReader.Positions());
+            WriteEntryFromReader(addWriter, type, addReader);
             addValid = addReader.Next();
         } else if (addDocId > delDocId) {
             // DEL entry with no matching ADD
@@ -275,7 +291,7 @@ TString SubtractPostingLists(
 
     // Remaining ADD entries
     while (addValid) {
-        WriteEntry(addWriter, type, addReader.DocId(), addReader.Freq(), addReader.Positions());
+        WriteEntryFromReader(addWriter, type, addReader);
         addValid = addReader.Next();
     }
 
