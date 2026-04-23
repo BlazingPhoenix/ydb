@@ -83,6 +83,7 @@
 #include <util/generic/algorithm.h>
 
 #include <util/string/escape.h>
+#include <util/digest/city.h>
 
 #include <cmath>
 
@@ -114,6 +115,17 @@ constexpr i32 RELEVANCE_COLUMN_MARKER = -1;
 // For n-gram queries the frequent n-grams are dropped entirely because n-gram
 // results are post-filtered anyway.
 constexpr double NGRAM_IMBALANCE_FACTOR = 10;
+
+// Find an IndexTable entry by its table name suffix (e.g., "indexImplPostingTable").
+// Returns -1 if not found.
+i32 FindIndexTableByName(const NKikimrKqp::TKqpFullTextSourceSettings* settings, TStringBuf tableSuffix) {
+    for (i32 i = 0; i < settings->GetIndexTables().size(); ++i) {
+        if (settings->GetIndexTables(i).GetTable().GetPath().EndsWith(tableSuffix)) {
+            return i;
+        }
+    }
+    return -1;
+}
 
 class TDocId;
 
@@ -677,6 +689,100 @@ public:
 };
 
 /**
+ * TLsmPostingTableReader -- reader for the LSM posting table (indexImplPostingTable).
+ *
+ * The LSM posting table has key = (word_id: Uint32, doc_id: Uint64) and optional
+ * freq (Uint32) and positions (String) columns. This reader requests only
+ * doc_id (and optionally freq), skipping word_id since it's known from the query.
+ * Arrow batch format is used for efficient columnar transfer.
+ */
+class TLsmPostingTableReader : public TTableReader<TLsmPostingTableReader> {
+    i32 FrequencyColumnIndex = 0;
+
+public:
+    TLsmPostingTableReader(const TIntrusivePtr<TKqpCounters>& counters,
+        const TTableId& tableId,
+        const TString& tablePath,
+        const IKqpGateway::TKqpSnapshot& snapshot,
+        const TString& logPrefix,
+        const TVector<NScheme::TTypeInfo>& keyColumnTypes,
+        const TVector<NScheme::TTypeInfo>& resultColumnTypes,
+        const TVector<i32>& resultColumnIds,
+        i32 frequencyColumnIndex)
+        : TTableReader(counters, tableId, tablePath, snapshot, logPrefix, keyColumnTypes, resultColumnTypes, resultColumnIds)
+        , FrequencyColumnIndex(frequencyColumnIndex)
+    {}
+
+    static TIntrusivePtr<TLsmPostingTableReader> FromSettings(
+        const TIntrusivePtr<TKqpCounters>& counters,
+        const IKqpGateway::TKqpSnapshot& snapshot,
+        const TString& logPrefix,
+        const NKikimrKqp::TKqpFullTextSourceSettings* settings,
+        bool withRelevance)
+    {
+        i32 postingIdx = FindIndexTableByName(settings, NTableIndex::NFulltext::PostingTable);
+        if (postingIdx < 0) {
+            return nullptr;
+        }
+
+        auto& info = settings->GetIndexTables(postingIdx);
+        auto& columns = info.GetColumns();
+        auto& keyColumns = info.GetKeyColumns();
+
+        TVector<NScheme::TTypeInfo> keyColumnTypes;
+        TVector<NScheme::TTypeInfo> resultColumnTypes;
+        TVector<i32> resultColumnIds;
+
+        for (const auto& keyColumn : keyColumns) {
+            keyColumnTypes.push_back(NScheme::TypeInfoFromProto(
+                keyColumn.GetTypeId(), keyColumn.GetTypeInfo()));
+
+            if (keyColumn.GetName() == WordIdColumn) {
+                // Don't request word_id column — it's the token key, not doc_id
+                continue;
+            }
+
+            resultColumnTypes.push_back(keyColumnTypes.back());
+            resultColumnIds.push_back(keyColumn.GetId());
+        }
+
+        bool useArrowFormat = false;
+        // Arrow format when result is a single Uint64 column (doc_id)
+        if (resultColumnTypes.size() == 1 && resultColumnTypes[0].GetTypeId() == NScheme::NTypeIds::Uint64) {
+            useArrowFormat = true;
+        }
+
+        YQL_ENSURE(useArrowFormat);
+
+        i32 freqColumnIndex = -1;
+        if (withRelevance) {
+            NScheme::TTypeInfo freqColumnType;
+            for (const auto& column : columns) {
+                if (column.GetName() == FreqColumn) {
+                    freqColumnIndex = column.GetId();
+                    freqColumnType = NScheme::TypeInfoFromProto(
+                        column.GetTypeId(), column.GetTypeInfo());
+                }
+            }
+            YQL_ENSURE(freqColumnIndex != -1);
+            resultColumnTypes.push_back(freqColumnType);
+            resultColumnIds.push_back(freqColumnIndex);
+            freqColumnIndex = resultColumnTypes.size() - 1;
+        }
+
+        TIntrusivePtr<TLsmPostingTableReader> reader = MakeIntrusive<TLsmPostingTableReader>(
+            counters, FromProto(info.GetTable()), info.GetTable().GetPath(), snapshot, logPrefix,
+            keyColumnTypes, resultColumnTypes, resultColumnIds, freqColumnIndex);
+        reader->SetUseArrowFormat(useArrowFormat);
+        return reader;
+    }
+
+    ui32 GetFrequencyColumnIndex() const {
+        return FrequencyColumnIndex;
+    }
+};
+
+/**
  * TArrowTokenStream -- streaming buffer for one token's posting list.
  *
  * Each token in the search query has its own TArrowTokenStream.  As
@@ -871,6 +977,92 @@ public:
         for(const auto& [shardId, range] : rangePartition) {
             RangesToRead.emplace_back(shardId, std::move(range));
         }
+    }
+};
+
+/**
+ * TLsmWordReadState -- per-query-token read state for the LSM posting table.
+ *
+ * Like TWordReadState but uses word_id (Uint32 hash of token) as the first
+ * key cell instead of the raw token string.  word_id = CityHash64(token) & 0xFFFFFFFF.
+ */
+class TLsmWordReadState : public TSimpleRefCount<TLsmWordReadState> {
+public:
+    ui64 WordIndex;
+    TString Word;
+    ui32 WordId;
+    bool PendingRead = false;
+    TIntrusivePtr<TLsmPostingTableReader> Reader;
+    std::deque<std::pair<ui64, TOwnedTableRange>> RangesToRead;
+    ui32 Frequency = 0;
+
+    bool L1 = true;
+    bool L2 = false;
+    ui32 L2StreamIndex = 0;
+    ui64 StartReadKeyFrom = 0;
+
+    using TPtr = TIntrusivePtr<TLsmWordReadState>;
+
+    explicit TLsmWordReadState(ui64 wordIndex, const TString& word, const TIntrusivePtr<TLsmPostingTableReader>& reader)
+        : WordIndex(wordIndex)
+        , Word(word)
+        , WordId(static_cast<ui32>(CityHash64(word.data(), word.size())))
+        , Reader(reader)
+    {
+        BuildRangesToRead();
+    }
+
+    std::pair<ui64, std::unique_ptr<TEvDataShard::TEvRead>> BuildNextRangeToRead(ui64 readId) {
+        YQL_ENSURE(!RangesToRead.empty());
+        auto [shardId, range] = RangesToRead.front();
+        RangesToRead.pop_front();
+        return std::make_pair(shardId, Reader->GetReadRequest(readId, range));
+    }
+
+    std::pair<ui64, std::unique_ptr<TEvDataShard::TEvRead>> ScheduleNextRead(ui64 readId) {
+        if (!RangesToRead.empty()) {
+            return BuildNextRangeToRead(readId);
+        }
+
+        return std::make_pair(0, nullptr);
+    }
+
+    void BuildRangesToRead() {
+        RangesToRead.clear();
+
+        std::vector<TCell> fromCells = {TCell::Make<ui32>(WordId), TCell::Make<ui64>(StartReadKeyFrom)};
+        std::vector<TCell> toCells = {TCell::Make<ui32>(WordId)};
+        auto range = TTableRange(fromCells, true, toCells, false /*toInclusive*/);
+
+        auto rangePartition = Reader->GetRangePartitioning(range);
+        for (const auto& [shardId, range] : rangePartition) {
+            RangesToRead.emplace_back(shardId, std::move(range));
+        }
+    }
+};
+
+/**
+ * TLsmL1DocumentInfo -- wraps a TDocumentInfo for L2 verification against
+ * the LSM posting table.  Uses word_id (Uint32) + doc_id (Uint64) as the
+ * point lookup key instead of (token_string, doc_id).
+ */
+class TLsmL1DocumentInfo : public TSimpleRefCount<TLsmL1DocumentInfo> {
+public:
+    using TPtr = TIntrusivePtr<TLsmL1DocumentInfo>;
+    TDocumentInfo::TPtr Document;
+    ui32 WordId;
+    TOwnedCellVec IndexKey;
+
+    TLsmL1DocumentInfo(TDocumentInfo::TPtr& document, ui32 wordId)
+        : Document(document)
+        , WordId(wordId)
+    {
+        TVector<TCell> point = {TCell::Make<ui32>(WordId), TCell::Make<ui64>(document->DocumentNumId)};
+        IndexKey = TOwnedCellVec(point);
+    }
+
+    TTableRange GetPoint() const {
+        return TTableRange(IndexKey);
     }
 };
 
@@ -1316,9 +1508,9 @@ public:
             return nullptr;
         }
 
-        YQL_ENSURE(settings->GetIndexTables().size() >= 3);
-        auto& info = settings->GetIndexTables(2);
-        YQL_ENSURE(info.GetTable().GetPath().EndsWith(StatsTable));
+        i32 statsIdx = FindIndexTableByName(settings, StatsTable);
+        YQL_ENSURE(statsIdx >= 0, "StatsTable not found in IndexTables");
+        auto& info = settings->GetIndexTables(statsIdx);
         auto& columns = info.GetColumns();
         auto& keyColumns = info.GetKeyColumns();
 
@@ -1490,6 +1682,8 @@ enum EReadKind : ui32 {
     EReadKind_Document = 3,       // Main table: full row data for matched docs
     EReadKind_TotalStats = 4,     // Stats table: corpus-wide aggregates
     EReadKind_Word_L2 = 5,        // L2 posting list point lookups
+    EReadKind_LsmWord = 6,        // L1 LSM posting table range scan
+    EReadKind_LsmWord_L2 = 7,     // L2 LSM posting table point lookups
 };
 
 // Metadata stored for each in-flight read so we can route the response.
@@ -2126,13 +2320,19 @@ private:
     TIntrusivePtr<TDocsTableReader> DocsTableReader;
     TIntrusivePtr<TDictTableReader> DictTableReader;
     TIntrusivePtr<TStatsTableReader> StatsTableReader;
+    TIntrusivePtr<TLsmPostingTableReader> LsmPostingTableReader;
+
+    // True when using the LSM posting table instead of the legacy token-based table.
+    bool UseLsmPosting = false;
 
     // Read infrastructure.
     TReadsState ReadsState;                                // Tracks all in-flight reads
     TReadItemsQueue<TDocumentInfo::TPtr> DocsReadingQueue; // Docs table + main table reads
     TReadItemsQueue<TL1DocumentInfo::TPtr> L2ReadingQueue; // L2 posting list point lookups
+    TReadItemsQueue<TLsmL1DocumentInfo::TPtr> LsmL2ReadingQueue; // L2 LSM posting table point lookups
     TReadItemsQueue<TWordReadState::TPtr> WordsReadingQueue; // Dict table lookups
-    TVector<TWordReadState::TPtr> Words;                   // Tokenized query terms
+    TVector<TWordReadState::TPtr> Words;                   // Tokenized query terms (legacy)
+    TVector<TLsmWordReadState::TPtr> LsmWords;             // Tokenized query terms (LSM)
 
     // Merge algorithms: L1 handles the primary merge (all or rare tokens),
     // L2 (optional) handles verification of frequent tokens.
@@ -2183,6 +2383,14 @@ private:
         if (Words.empty()) {
             RuntimeError("No search terms were extracted from the query", NYql::NDqProto::StatusIds::BAD_REQUEST);
             return false;
+        }
+
+        // If LSM posting table is available, create LsmWords mirroring Words
+        if (UseLsmPosting) {
+            LsmWords.reserve(Words.size());
+            for (const auto& word : Words) {
+                LsmWords.emplace_back(MakeIntrusive<TLsmWordReadState>(word->WordIndex, word->Word, LsmPostingTableReader));
+            }
         }
 
         return true;
@@ -2243,6 +2451,17 @@ private:
         auto [shardId, ev] = word->ScheduleNextRead(readId);
         if (ev) {
             ReadsState.SendEvRead(shardId, ev, TReadInfo{EReadKind_Word, word->WordIndex, shardId});
+            return true;
+        }
+
+        return false;
+    }
+
+    bool ContinueLsmWordRead(TLsmWordReadState::TPtr word) {
+        ui64 readId = ReadsState.GetNextReadId();
+        auto [shardId, ev] = word->ScheduleNextRead(readId);
+        if (ev) {
+            ReadsState.SendEvRead(shardId, ev, TReadInfo{EReadKind_LsmWord, word->WordIndex, shardId});
             return true;
         }
 
@@ -2403,9 +2622,30 @@ private:
             QueryCtx->SetK1Factor(Settings->GetK1Factor());
         }
 
-        for (auto& word : Words) {
-            if (word->L1) {
-                ContinueWordRead(word);
+        if (UseLsmPosting) {
+            // Synchronize L1/L2 flags and word indices from Words to LsmWords
+            // (Words may have been reordered/pruned by imbalance logic above)
+            LsmWords.clear();
+            LsmWords.reserve(Words.size());
+            for (const auto& word : Words) {
+                auto lsmWord = MakeIntrusive<TLsmWordReadState>(word->WordIndex, word->Word, LsmPostingTableReader);
+                lsmWord->L1 = word->L1;
+                lsmWord->L2 = word->L2;
+                lsmWord->L2StreamIndex = word->L2StreamIndex;
+                lsmWord->Frequency = word->Frequency;
+                LsmWords.emplace_back(std::move(lsmWord));
+            }
+
+            for (auto& word : LsmWords) {
+                if (word->L1) {
+                    ContinueLsmWordRead(word);
+                }
+            }
+        } else {
+            for (auto& word : Words) {
+                if (word->L1) {
+                    ContinueWordRead(word);
+                }
             }
         }
     }
@@ -2427,6 +2667,9 @@ private:
             }
             if (StatsTableReader) {
                 StatsTableReader->AddResolvePartitioningRequest(request);
+            }
+            if (LsmPostingTableReader) {
+                LsmPostingTableReader->AddResolvePartitioningRequest(request);
             }
         }
 
@@ -2470,9 +2713,12 @@ public:
         , DocsTableReader(TDocsTableReader::FromSettings(Counters, Snapshot, LogPrefix, Settings, MainTableReader->GetWithRelevance()))
         , DictTableReader(TDictTableReader::FromSettings(Counters, Snapshot, LogPrefix, Settings))
         , StatsTableReader(TStatsTableReader::FromSettings(Counters, Snapshot, LogPrefix, Settings, MainTableReader->GetWithRelevance()))
+        , LsmPostingTableReader(TLsmPostingTableReader::FromSettings(Counters, Snapshot, LogPrefix, Settings, MainTableReader->GetWithRelevance()))
+        , UseLsmPosting(LsmPostingTableReader != nullptr)
         , ReadsState(Counters, LogPrefix)
         , DocsReadingQueue(SelfId(), ReadsState)
         , L2ReadingQueue(SelfId(), ReadsState)
+        , LsmL2ReadingQueue(SelfId(), ReadsState)
         , WordsReadingQueue(SelfId(), ReadsState)
     {
         Y_ABORT_UNLESS(Arena);
@@ -2637,6 +2883,14 @@ public:
         ReadTotalStats();
     }
 
+    void RetryLsmWordRead(ui64 wordIndex, ui64 readId) {
+        YQL_ENSURE(wordIndex < LsmWords.size(), "LSM Word index out of bounds");
+        auto& word = LsmWords[wordIndex];
+        word->BuildRangesToRead();
+        ReadsState.RemoveRead(readId);
+        ContinueLsmWordRead(word);
+    }
+
     // Re-issue a single read by its ReadId, dispatching to the appropriate
     // retry path based on the read's EReadKind.
     void DoRetrySingleRead(ui64 readId) {
@@ -2662,6 +2916,12 @@ public:
                 break;
             case EReadKind_Word_L2:
                 L2ReadingQueue.RetrySequential(IndexTableReader.Get(), EReadKind_Word_L2, readId, readInfo.Cookie);
+                break;
+            case EReadKind_LsmWord:
+                RetryLsmWordRead(readInfo.Cookie, readId);
+                break;
+            case EReadKind_LsmWord_L2:
+                LsmL2ReadingQueue.RetrySequential(LsmPostingTableReader.Get(), EReadKind_LsmWord_L2, readId, readInfo.Cookie);
                 break;
             case EReadKind_TotalStats:
                 RetryTotalStatsRead(readId);
@@ -2746,15 +3006,18 @@ public:
         MainTableReader->SetPartitionInfo(resultSet[0].KeyDescription);
         IndexTableReader->SetPartitionInfo(resultSet[1].KeyDescription);
         if (Settings->GetIndexType() == NKqpProto::EKqpFullTextIndexType::EKqpFullTextRelevance) {
-            size_t count = 3 + (DocsTableReader ? 1 : 0) + (StatsTableReader ? 1 : 0);
-            YQL_ENSURE(resultSet.size() == count, "Expected " << count << " tables for flat relevance index");
-            DictTableReader->SetPartitionInfo(resultSet[2].KeyDescription);
+            size_t idx = 2;
+            DictTableReader->SetPartitionInfo(resultSet[idx++].KeyDescription);
             if (DocsTableReader) {
-                DocsTableReader->SetPartitionInfo(resultSet[3].KeyDescription);
+                DocsTableReader->SetPartitionInfo(resultSet[idx++].KeyDescription);
             }
             if (StatsTableReader) {
-                StatsTableReader->SetPartitionInfo(resultSet[3 + (DocsTableReader ? 1 : 0)].KeyDescription);
+                StatsTableReader->SetPartitionInfo(resultSet[idx++].KeyDescription);
             }
+            if (LsmPostingTableReader) {
+                LsmPostingTableReader->SetPartitionInfo(resultSet[idx++].KeyDescription);
+            }
+            YQL_ENSURE(resultSet.size() == idx, "Expected " << idx << " tables for relevance index, got " << resultSet.size());
         }
 
         if (ExtractAndTokenizeExpression()) {
@@ -3042,6 +3305,91 @@ public:
         }
     }
 
+    void LsmL1WordResult(std::unique_ptr<NKikimr::TEvDataShard::TEvReadResult> msg, ui64 wordIndex, bool finished) {
+        YQL_ENSURE(wordIndex < LsmWords.size());
+        auto& incomingWordInfo = LsmWords[wordIndex];
+        YQL_ENSURE(incomingWordInfo->L1);
+
+        L1MergeAlgo->AddResult(wordIndex, std::move(msg));
+        incomingWordInfo->StartReadKeyFrom = L1MergeAlgo->GetMaxTokenKey(wordIndex) + 1;
+
+        if (finished) {
+            if (!ContinueLsmWordRead(incomingWordInfo)) {
+                L1MergeAlgo->FinishTokenStream(wordIndex);
+            }
+        }
+
+        std::vector<TDocumentInfo::TPtr> matches = L1MergeAlgo->FindMatches();
+        if (L2MergeAlgo) {
+            ScheduleLsmL2Read(matches);
+        } else {
+            FetchDocumentDetails(matches);
+        }
+    }
+
+    void LsmL2WordResult(std::unique_ptr<NKikimr::TEvDataShard::TEvReadResult> msg, ui64 recReadId, ui64 wordIndex, bool finished) {
+        YQL_ENSURE(wordIndex < LsmWords.size());
+        auto& wordInfo = LsmWords[wordIndex];
+        YQL_ENSURE(wordInfo->L2);
+
+        L2MergeAlgo->AddResult(wordInfo->L2StreamIndex, std::move(msg));
+        auto& readItems = LsmL2ReadingQueue.GetReadItems(recReadId);
+        ui64 maxKeyBarrier = L2MergeAlgo->GetMaxTokenKey(wordInfo->L2StreamIndex);
+        while (!readItems.Empty() && readItems.GetItem()->Document->DocumentNumId <= maxKeyBarrier) {
+            readItems.PopItem();
+        }
+
+        auto& schedule = LsmL2ReadingQueue.GetSequentialSchedule(wordIndex);
+        while (schedule.HasSentItems() && schedule.GetItem()->Document->DocumentNumId <= maxKeyBarrier) {
+            schedule.PopItem();
+        }
+
+        if (finished) {
+            LsmL2ReadingQueue.ClearReadItems(readItems);
+            while (schedule.HasSentItems()) {
+                schedule.PopItem();
+            }
+        }
+
+        LsmL2ReadingQueue.UpdateReadStatus(recReadId, readItems, finished);
+        if (finished) {
+            LsmL2ReadingQueue.SendNextSequentialRead(LsmPostingTableReader.Get(), EReadKind_LsmWord_L2, wordIndex);
+            if (LsmL2ReadingQueue.GetSequentialSchedule(wordIndex).Empty() && L1MergeAlgo->Done()) {
+                L2MergeAlgo->FinishTokenStream(wordInfo->L2StreamIndex);
+            }
+        }
+
+        std::vector<TDocumentInfo::TPtr> matches = L2MergeAlgo->FindMatches();
+        MergeL2MatchFrequencies(matches);
+        FetchDocumentDetails(matches);
+    }
+
+    void ScheduleLsmL2Read(std::vector<TDocumentInfo::TPtr>& l1matched) {
+        for (int i = LsmWords.size() - 1; i >= 0; i--) {
+            auto& word = LsmWords[i];
+            if (word->L1) {
+                continue;
+            }
+
+            std::vector<TLsmL1DocumentInfo::TPtr> remappedMatches;
+            remappedMatches.reserve(l1matched.size());
+            for (auto& match : l1matched) {
+                remappedMatches.emplace_back(MakeIntrusive<TLsmL1DocumentInfo>(match, word->WordId));
+            }
+
+            LsmL2ReadingQueue.Sequential(LsmPostingTableReader.Get(), EReadKind_LsmWord_L2, remappedMatches, i);
+            if (LsmL2ReadingQueue.GetSequentialSchedule(i).Empty() && L1MergeAlgo->Done()) {
+                L2MergeAlgo->FinishTokenStream(LsmWords[i]->L2StreamIndex);
+            }
+        }
+
+        L1MergedDocuments.insert(L1MergedDocuments.end(), l1matched.begin(), l1matched.end());
+
+        std::vector<TDocumentInfo::TPtr> matches = L2MergeAlgo->FindMatches();
+        MergeL2MatchFrequencies(matches);
+        FetchDocumentDetails(matches);
+    }
+
     template<typename TReader>
     void ExportTableReaderStats(NDqProto::TDqTaskStats* stats, const TIntrusivePtr<TReader>& reader) {
         NDqProto::TDqTableStats* tableStats = nullptr;
@@ -3065,12 +3413,20 @@ public:
         if (last) {
             if (L1MergeAlgo) {
                 auto [rows, bytes] = L1MergeAlgo->GetStats();
-                IndexTableReader->RecvStats(rows, bytes);
+                if (UseLsmPosting) {
+                    LsmPostingTableReader->RecvStats(rows, bytes);
+                } else {
+                    IndexTableReader->RecvStats(rows, bytes);
+                }
             }
 
             if (L2MergeAlgo) {
                 auto [rows, bytes] = L2MergeAlgo->GetStats();
-                IndexTableReader->RecvStats(rows, bytes);
+                if (UseLsmPosting) {
+                    LsmPostingTableReader->RecvStats(rows, bytes);
+                } else {
+                    IndexTableReader->RecvStats(rows, bytes);
+                }
             }
 
             ExportTableReaderStats(stats, MainTableReader);
@@ -3083,6 +3439,9 @@ public:
             }
             if (DictTableReader) {
                 ExportTableReaderStats(stats, DictTableReader);
+            }
+            if (LsmPostingTableReader) {
+                ExportTableReaderStats(stats, LsmPostingTableReader);
             }
         }
     }
@@ -3209,6 +3568,12 @@ public:
                 break;
             case EReadKind_Word_L2:
                 L2WordResult(std::unique_ptr<NKikimr::TEvDataShard::TEvReadResult>(ev->Release().Release()), readId, cookie, record.GetFinished());
+                break;
+            case EReadKind_LsmWord:
+                LsmL1WordResult(std::unique_ptr<NKikimr::TEvDataShard::TEvReadResult>(ev->Release().Release()), cookie, record.GetFinished());
+                break;
+            case EReadKind_LsmWord_L2:
+                LsmL2WordResult(std::unique_ptr<NKikimr::TEvDataShard::TEvReadResult>(ev->Release().Release()), readId, cookie, record.GetFinished());
                 break;
             case EReadKind_TotalStats:
                 HandleTotalStatsResult(msg);

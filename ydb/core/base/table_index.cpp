@@ -49,6 +49,7 @@ const TString ImplTables[] = {
     TString{NKMeans::PostingTable} + NKMeans::BuildSuffix1,
     NFulltext::DocsTable,
     NFulltext::DictTable,
+    NFulltext::PostingTable,
     NFulltext::StatsTable,
 };
 
