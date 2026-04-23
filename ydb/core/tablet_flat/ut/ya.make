@@ -35,6 +35,7 @@ SRCS(
     ut_sausage.cpp
     ut_stat.cpp
     ut_comp_gen.cpp
+    ut_comp_posting.cpp
     ut_compaction.cpp
     ut_compaction_multi.cpp
     ut_datetime.cpp
