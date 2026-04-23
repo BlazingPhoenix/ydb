@@ -285,9 +285,14 @@ void DropIndex(NQuery::TQueryClient& db) {
 }
 
 TResultSet ReadIndex(NQuery::TQueryClient& db, const char* table = "indexImplTable") {
+    TString columns = "*";
+    if (TStringBuf(table) == NTableIndex::NFulltext::DictTable) {
+        // Exclude word_id from output to keep existing test expectations stable
+        columns = Sprintf("`%s`, `%s`", NTableIndex::NFulltext::FreqColumn, NTableIndex::NFulltext::TokenColumn);
+    }
     TString query = Sprintf(R"sql(
-        SELECT * FROM `/Root/Texts/fulltext_idx/%s`;
-    )sql", table);
+        SELECT %s FROM `/Root/Texts/fulltext_idx/%s`;
+    )sql", columns.c_str(), table);
     auto result = db.ExecuteQuery(query, NYdb::NQuery::TTxControl::NoTx()).ExtractValueSync();
     UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), EStatus::SUCCESS, result.GetIssues().ToString());
     return result.GetResultSet(0);

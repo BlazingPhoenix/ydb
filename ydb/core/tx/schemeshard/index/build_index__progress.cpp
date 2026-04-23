@@ -9,6 +9,8 @@
 
 #include <ydb/core/base/table_index.h>
 #include <ydb/core/scheme/scheme_tablecell.h>
+
+#include <util/digest/city.h>
 #include <ydb/core/scheme/scheme_types_proto.h>
 #include <ydb/core/tx/datashard/range_ops.h>
 #include <ydb/core/tx/datashard/scan_common.h>
@@ -1297,8 +1299,9 @@ private:
 
         TVector<std::pair<TSerializedCellVec, TSerializedCellVec>> uploadRows;
         for (auto& [token, docCount]: borders) {
+            const ui32 wordId = static_cast<ui32>(CityHash64(token.data(), token.size()));
             uploadRows.emplace_back(TSerializedCellVec{TVector<TCell>{TCell(token)}},
-                TSerializedCellVec{TVector<TCell>{TCell::Make(docCount)}});
+                TSerializedCellVec{TVector<TCell>{TCell::Make(wordId), TCell::Make(docCount)}});
         }
 
         auto mainTablePath = TPath::Init(buildInfo.TablePathId, Self);
@@ -1310,12 +1313,14 @@ private:
         Y_ENSURE(buildInfo.IndexColumns.size() == 1);
         auto textColumnInfo = baseColumnTypes.at(buildInfo.IndexColumns[0]);
 
-        auto types = std::make_shared<NTxProxy::TUploadTypes>(2);
+        auto types = std::make_shared<NTxProxy::TUploadTypes>(3);
         Ydb::Type type;
         NScheme::ProtoFromTypeInfo(textColumnInfo, type);
         (*types)[0] = {NTableIndex::NFulltext::TokenColumn, type};
+        type.set_type_id(NTableIndex::NFulltext::WordIdType);
+        (*types)[1] = {NTableIndex::NFulltext::WordIdColumn, type};
         type.set_type_id(NTableIndex::NFulltext::DocCountType);
-        (*types)[1] = {NTableIndex::NFulltext::FreqColumn, type};
+        (*types)[2] = {NTableIndex::NFulltext::FreqColumn, type};
 
         auto path = GetBuildPath(Self, buildInfo, NTableIndex::NFulltext::DictTable);
         auto actor = new TUploadSampleK(CanonizePath(Self->RootPathElements), path.PathString(),

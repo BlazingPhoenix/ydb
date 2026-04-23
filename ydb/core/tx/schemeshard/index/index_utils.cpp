@@ -529,6 +529,13 @@ auto CalcFulltextDictImplTableDescImpl(
     implTableDesc.AddKeyColumnNames(NFulltext::TokenColumn);
     {
         auto col = implTableDesc.AddColumns();
+        col->SetName(NFulltext::WordIdColumn);
+        col->SetType(NFulltext::WordIdTypeName);
+        col->SetTypeId(NFulltext::WordIdType);
+        col->SetNotNull(false);
+    }
+    {
+        auto col = implTableDesc.AddColumns();
         col->SetName(NFulltext::FreqColumn);
         col->SetType(NFulltext::DocCountTypeName);
         col->SetTypeId(NFulltext::DocCountType);

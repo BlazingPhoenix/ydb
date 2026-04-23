@@ -9,6 +9,8 @@
 #include <ydb/core/base/fulltext.h>
 #include <ydb/core/scheme/scheme_tablecell.h>
 
+#include <util/digest/city.h>
+
 #include <ydb/core/tx/tx_proxy/proxy.h>
 #include <ydb/core/tx/tx_proxy/upload_rows.h>
 
@@ -30,7 +32,7 @@ using namespace NKikimr::NFulltext;
  * This scan takes the indexImplTable and writes output to indexImplTokensTable.
  *
  * Source columns: __ydb_token, <PK columns>, __ydb_freq
- * Destination columns: __ydb_token, __ydb_freq
+ * Destination columns: __ydb_token, __ydb_word_id, __ydb_freq
  *
  * Request:
  * - The client sends TEvBuildFulltextDictRequest with:
@@ -112,6 +114,11 @@ public:
             Ydb::Type type;
             NScheme::ProtoFromTypeInfo(types.at(TokenColumn), type);
             uploadTypes->emplace_back(TokenColumn, type);
+        }
+        {
+            Ydb::Type type;
+            type.set_type_id(WordIdType);
+            uploadTypes->emplace_back(WordIdColumn, type);
         }
         {
             Ydb::Type type;
@@ -309,9 +316,10 @@ protected:
         if (last && SkipLastToken) {
             return;
         }
+        const ui32 wordId = static_cast<ui32>(CityHash64(LastToken.data(), LastToken.size()));
         TVector<TCell> pk = {TCell(LastToken)};
-        TVector<TCell> freq = {TCell::Make(LastTokenRows)};
-        OutputBuf->AddRow(pk, freq, pk);
+        TVector<TCell> values = {TCell::Make(wordId), TCell::Make(LastTokenRows)};
+        OutputBuf->AddRow(pk, values, pk);
         LastToken.clear();
         LastTokenRows = 0;
     }

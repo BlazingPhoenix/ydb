@@ -126,6 +126,7 @@ Y_UNIT_TEST_SUITE(TTxDataShardBuildFulltextDictScan) {
         options.AllowSystemColumnNames(true);
         options.Columns({
             {TokenColumn, "String", true, true},
+            {WordIdColumn, WordIdTypeName, false, false},
             {FreqColumn, DocCountTypeName, false, false},
         });
         CreateShardedTable(server, sender, "/Root", "table-dict", options);
@@ -203,25 +204,25 @@ Y_UNIT_TEST_SUITE(TTxDataShardBuildFulltextDictScan) {
         });
         auto& record = reply->Get()->Record;
 
-        TString expected = R"(__ydb_token = apple, __ydb_freq = 3
-__ydb_token = blue, __ydb_freq = 1
-__ydb_token = car, __ydb_freq = 1
-__ydb_token = green, __ydb_freq = 1
-__ydb_token = red, __ydb_freq = 2
+        TString expected = R"(__ydb_token = apple, __ydb_word_id = 3582305373, __ydb_freq = 3
+__ydb_token = blue, __ydb_word_id = 3431880003, __ydb_freq = 1
+__ydb_token = car, __ydb_word_id = 758022462, __ydb_freq = 1
+__ydb_token = green, __ydb_word_id = 1390465085, __ydb_freq = 1
+__ydb_token = red, __ydb_word_id = 3052168893, __ydb_freq = 2
 )";
 
         if (SkipFirst) {
             UNIT_ASSERT_EQUAL(record.GetFirstToken(), "and");
             UNIT_ASSERT_EQUAL(record.GetFirstTokenRows(), 1);
         } else {
-            expected = "__ydb_token = and, __ydb_freq = 1\n" + expected;
+            expected = "__ydb_token = and, __ydb_word_id = 549012902, __ydb_freq = 1\n" + expected;
         }
 
         if (SkipLast) {
             UNIT_ASSERT_EQUAL(record.GetLastToken(), "yellow");
             UNIT_ASSERT_EQUAL(record.GetLastTokenRows(), 1);
         } else {
-            expected += "__ydb_token = yellow, __ydb_freq = 1\n";
+            expected += "__ydb_token = yellow, __ydb_word_id = 402978635, __ydb_freq = 1\n";
         }
 
         auto index = ReadShardedTable(server, kDictTable);

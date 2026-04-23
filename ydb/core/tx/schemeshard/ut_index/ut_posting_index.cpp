@@ -76,11 +76,11 @@ Y_UNIT_TEST_SUITE(TPostingIndexTests) {
                         { DocLengthColumn, "id", "covered" }, {},
                         { "id" }, true) });
 
-            // Dict table: token + freq
+            // Dict table: token + word_id + freq
             TestDescribeResult(DescribePrivatePath(runtime, "/MyRoot/texts/idx_posting/indexImplDictTable"),{
                 NLs::PathExist,
                 NLs::CheckColumns("indexImplDictTable",
-                        { TokenColumn, FreqColumn }, {},
+                        { TokenColumn, WordIdColumn, FreqColumn }, {},
                         { TokenColumn }, true) });
 
             // Stats table: id + doc_count + sum_doc_length

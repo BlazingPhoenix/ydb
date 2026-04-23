@@ -922,6 +922,7 @@ public:
     TIntrusivePtr<TIndexTableImplReader> Reader;
     std::deque<std::pair<ui64, TOwnedTableRange>> RangesToRead;
     ui32 Frequency = 0;
+    ui32 DictWordId = 0;  // word_id from dict table (0 if not available)
 
     TCell TokenCell;
     TOwnedTableRange WordKeyCells;
@@ -983,8 +984,9 @@ public:
 /**
  * TLsmWordReadState -- per-query-token read state for the LSM posting table.
  *
- * Like TWordReadState but uses word_id (Uint32 hash of token) as the first
- * key cell instead of the raw token string.  word_id = CityHash64(token) & 0xFFFFFFFF.
+ * Like TWordReadState but uses word_id (Uint32) as the first key cell instead
+ * of the raw token string.  word_id is obtained from the dictionary table
+ * during the enrichment phase.
  */
 class TLsmWordReadState : public TSimpleRefCount<TLsmWordReadState> {
 public:
@@ -1003,10 +1005,10 @@ public:
 
     using TPtr = TIntrusivePtr<TLsmWordReadState>;
 
-    explicit TLsmWordReadState(ui64 wordIndex, const TString& word, const TIntrusivePtr<TLsmPostingTableReader>& reader)
+    explicit TLsmWordReadState(ui64 wordIndex, const TString& word, ui32 wordId, const TIntrusivePtr<TLsmPostingTableReader>& reader)
         : WordIndex(wordIndex)
         , Word(word)
-        , WordId(static_cast<ui32>(CityHash64(word.data(), word.size())))
+        , WordId(wordId)
         , Reader(reader)
     {
         BuildRangesToRead();
@@ -1639,10 +1641,16 @@ public:
         TVector<NScheme::TTypeInfo> resultKeyColumnTypes;
         TVector<i32> resultKeyColumnIds;
 
+        i32 wordIdColumnIndex = -1;
+        NScheme::TTypeInfo wordIdColumnType;
         i32 freqColumnIndex = -1;
         NScheme::TTypeInfo freqColumnType;
         for (const auto& column : columns) {
-            if (column.GetName() == FreqColumn) {
+            if (column.GetName() == WordIdColumn) {
+                wordIdColumnIndex = column.GetId();
+                wordIdColumnType = NScheme::TypeInfoFromProto(
+                    column.GetTypeId(), column.GetTypeInfo());
+            } else if (column.GetName() == FreqColumn) {
                 freqColumnIndex = column.GetId();
                 freqColumnType = NScheme::TypeInfoFromProto(
                     column.GetTypeId(), column.GetTypeInfo());
@@ -1656,21 +1664,48 @@ public:
             resultKeyColumnIds.push_back(keyColumn.GetId());
         }
 
+        // word_id column (may be absent in older indexes)
+        i32 wordIdResultIndex = -1;
+        if (wordIdColumnIndex != -1) {
+            wordIdResultIndex = resultKeyColumnTypes.size();
+            resultKeyColumnTypes.push_back(wordIdColumnType);
+            resultKeyColumnIds.push_back(wordIdColumnIndex);
+        }
+
         YQL_ENSURE(freqColumnIndex != -1);
+        i32 freqResultIndex = resultKeyColumnTypes.size();
         resultKeyColumnTypes.push_back(freqColumnType);
         resultKeyColumnIds.push_back(freqColumnIndex);
 
-        return MakeIntrusive<TDictTableReader>(counters, FromProto(info.GetTable()), info.GetTable().GetPath(), snapshot, logPrefix,
+        auto reader = MakeIntrusive<TDictTableReader>(counters, FromProto(info.GetTable()), info.GetTable().GetPath(), snapshot, logPrefix,
             keyColumnTypes, resultKeyColumnTypes, resultKeyColumnIds);
+        reader->WordIdResultIndex = wordIdResultIndex;
+        reader->FreqResultIndex = freqResultIndex;
+        return reader;
     }
 
     TStringBuf GetWord(const TConstArrayRef<TCell>& row) const {
         return row[0].AsBuf();
     }
 
-    ui64 GetWordFrequency(const TConstArrayRef<TCell>& row) const {
-        return row[GetResultColumnTypes().size() - 1].AsValue<ui64>();
+    // Returns word_id from the dict table row, or 0 if the column is absent.
+    ui32 GetWordId(const TConstArrayRef<TCell>& row) const {
+        if (WordIdResultIndex >= 0) {
+            return row[WordIdResultIndex].AsValue<ui32>();
+        }
+        return 0;
     }
+
+    bool HasWordId() const {
+        return WordIdResultIndex >= 0;
+    }
+
+    ui64 GetWordFrequency(const TConstArrayRef<TCell>& row) const {
+        return row[FreqResultIndex].AsValue<ui64>();
+    }
+
+    i32 WordIdResultIndex = -1;
+    i32 FreqResultIndex = -1;
 };
 
 // Discriminator for in-flight TEvRead requests so HandleReadResult can
@@ -2385,14 +2420,6 @@ private:
             return false;
         }
 
-        // If LSM posting table is available, create LsmWords mirroring Words
-        if (UseLsmPosting) {
-            LsmWords.reserve(Words.size());
-            for (const auto& word : Words) {
-                LsmWords.emplace_back(MakeIntrusive<TLsmWordReadState>(word->WordIndex, word->Word, LsmPostingTableReader));
-            }
-        }
-
         return true;
     }
 
@@ -2623,12 +2650,12 @@ private:
         }
 
         if (UseLsmPosting) {
-            // Synchronize L1/L2 flags and word indices from Words to LsmWords
-            // (Words may have been reordered/pruned by imbalance logic above)
+            // Create LsmWords from Words, using word_id from dict table lookups.
+            // Words may have been reordered/pruned by imbalance logic above.
             LsmWords.clear();
             LsmWords.reserve(Words.size());
             for (const auto& word : Words) {
-                auto lsmWord = MakeIntrusive<TLsmWordReadState>(word->WordIndex, word->Word, LsmPostingTableReader);
+                auto lsmWord = MakeIntrusive<TLsmWordReadState>(word->WordIndex, word->Word, word->DictWordId, LsmPostingTableReader);
                 lsmWord->L1 = word->L1;
                 lsmWord->L2 = word->L2;
                 lsmWord->L2StreamIndex = word->L2StreamIndex;
@@ -3156,6 +3183,9 @@ public:
             YQL_ENSURE(!readItems.Empty(), "Word not found in read items");
             auto& word = readItems.GetItem();
             word->Frequency = DictTableReader->GetWordFrequency(row);
+            if (DictTableReader->HasWordId()) {
+                word->DictWordId = DictTableReader->GetWordId(row);
+            }
             readItems.PopItem();
         }
 
