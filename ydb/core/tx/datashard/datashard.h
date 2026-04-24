@@ -381,6 +381,9 @@ namespace TEvDataShard {
         EvValidateRowConditionRequest,
         EvValidateRowConditionResponse,
 
+        EvClusterTreeRecalculateRequest,
+        EvClusterTreeRecalculateResponse,
+
         EvEnd
     };
 
@@ -2002,6 +2005,20 @@ namespace TEvDataShard {
         : public TEventPB<TEvValidateRowConditionResponse,
                           NKikimrTxDataShard::TEvValidateRowConditionResponse,
                           TEvDataShard::EvValidateRowConditionResponse>
+    {
+    };
+
+    struct TEvClusterTreeRecalculateRequest
+        : public TEventPB<TEvClusterTreeRecalculateRequest,
+                          NKikimrTxDataShard::TEvClusterTreeRecalculateRequest,
+                          TEvDataShard::EvClusterTreeRecalculateRequest>
+    {
+    };
+
+    struct TEvClusterTreeRecalculateResponse
+        : public TEventPB<TEvClusterTreeRecalculateResponse,
+                          NKikimrTxDataShard::TEvClusterTreeRecalculateResponse,
+                          TEvDataShard::EvClusterTreeRecalculateResponse>
     {
     };
 };

@@ -182,6 +182,7 @@ struct TIndexBuildInfo: public TSimpleRefCount<TIndexBuildInfo> {
             Recompute,
             Filter,
             FilterBorders,
+            Recalculate,
         };
         ui32 Level = 1;
         ui32 Round = 0;

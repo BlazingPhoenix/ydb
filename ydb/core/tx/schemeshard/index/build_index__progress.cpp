@@ -959,6 +959,38 @@ private:
         ToTabletSend.emplace(shardId, std::move(ev));
     }
 
+    void SendKMeansRecalculateRequest(TShardIdx shardIdx, TIndexBuildInfo& buildInfo) {
+        Y_ENSURE(buildInfo.IsBuildVectorIndex());
+        Y_ENSURE(buildInfo.KMeans.State == TIndexBuildInfo::TKMeans::Recalculate);
+        auto ev = MakeHolder<TEvDataShard::TEvClusterTreeRecalculateRequest>();
+        ev->Record.SetId(ui64(BuildId));
+
+        // Scan the posting table (leaf level)
+        auto path = GetBuildPath(Self, buildInfo, NTableIndex::NKMeans::PostingTable);
+        path->PathId.ToProto(ev->Record.MutablePathId());
+
+        *ev->Record.MutableSettings() = std::get<NKikimrSchemeOp::TVectorIndexKmeansTreeDescription>(
+            buildInfo.SpecializedIndexDescription).GetSettings().settings();
+
+        ev->Record.SetParent(buildInfo.KMeans.Parent);
+
+        // Add child cluster IDs for the current parent
+        NTableIndex::NKMeans::TClusterId child = buildInfo.KMeans.Child;
+        for (ui32 i = 0; i < buildInfo.KMeans.K; i++) {
+            ev->Record.AddClusterIds(child + i);
+        }
+
+        // Add embedding column name
+        ev->Record.SetEmbeddingColumn(buildInfo.IndexColumns.back());
+
+        ev->Record.SetDatabaseName(CanonizePath(Self->RootPathElements));
+
+        auto shardId = FillScanRequestCommon(ev->Record, shardIdx, buildInfo);
+        LOG_N("TTxBuildProgress: TEvClusterTreeRecalculateRequest: " << ev->Record.ShortDebugString());
+
+        ToTabletSend.emplace(shardId, std::move(ev));
+    }
+
     void SendUploadKMeansBordersRequest(TIndexBuildInfo& buildInfo) {
         auto buildPath = GetBuildPath(Self, buildInfo, buildInfo.KMeans.ReadFrom());
         const auto& buildTableInfo = Self->Tables.at(buildPath->PathId);
@@ -1554,6 +1586,14 @@ private:
         return SendToShards(buildInfo, [&](TShardIdx shardIdx) { SendKMeansFilterRequest(shardIdx, buildInfo); });
     }
 
+    bool SendKMeansRecalculate(TIndexBuildInfo& buildInfo) {
+        if (NoShardsAdded(buildInfo)) {
+            AddAllShards(buildInfo);
+        }
+        return SendToShards(buildInfo, [&](TShardIdx shardIdx) { SendKMeansRecalculateRequest(shardIdx, buildInfo); }) &&
+               buildInfo.DoneShards.size() == buildInfo.Shards.size();
+    }
+
     bool SendKMeansLocal(TIndexBuildInfo& buildInfo) {
         return SendToShards(buildInfo, [&](TShardIdx shardIdx) { SendKMeansLocalRequest(shardIdx, buildInfo); });
     }
@@ -1750,8 +1790,62 @@ private:
                 return false;
             }
             return FillVectorIndexNextLevel(txc, buildInfo);
+        } else if (buildInfo.KMeans.State == TIndexBuildInfo::TKMeans::Recalculate) {
+            return FillVectorIndexRecalculate(txc, buildInfo);
         }
         Y_ENSURE(false);
+    }
+
+    bool FillVectorIndexRecalculate(TTransactionContext& txc, TIndexBuildInfo& buildInfo) {
+        Y_ENSURE(buildInfo.KMeans.State == TIndexBuildInfo::TKMeans::Recalculate);
+
+        if (buildInfo.Sample.State == TIndexBuildInfo::TSample::EState::Done) {
+            // Upload completed - move to next parent at this level
+            if (buildInfo.KMeans.NeedsAnotherParent()) {
+                buildInfo.KMeans.NextParent();
+                buildInfo.KMeans.State = TIndexBuildInfo::TKMeans::Recalculate;
+                buildInfo.Sample.State = TIndexBuildInfo::TSample::EState::Collect;
+                ClearDoneShards(txc, buildInfo);
+                PersistKMeansState(txc, buildInfo);
+                Progress(BuildId);
+                return false;
+            }
+            // All parents at this level done - recalculate complete
+            return true;
+        }
+
+        if (buildInfo.Sample.State == TIndexBuildInfo::TSample::EState::Upload) {
+            // Wait for upload to complete
+            return false;
+        }
+
+        if (NoShardsAdded(buildInfo)) {
+            // On first entry, reset parent iteration if starting from end of BUILD
+            if (buildInfo.Sample.State == TIndexBuildInfo::TSample::EState::Collect &&
+                !buildInfo.KMeans.NeedsAnotherParent())
+            {
+                buildInfo.KMeans.Parent = buildInfo.KMeans.ParentBegin;
+            }
+            AddAllShards(buildInfo);
+        }
+
+        if (!SendKMeansRecalculate(buildInfo)) {
+            return false;
+        }
+
+        // All shards responded - upload new centroids to the level table
+        ClearDoneShards(txc, buildInfo);
+
+        // Persist clusters to DB and populate Sample.Rows for upload
+        {
+            NIceDb::TNiceDb db(txc.DB);
+            Self->PersistBuildIndexClustersToSample(db, buildInfo);
+        }
+
+        buildInfo.Sample.State = TIndexBuildInfo::TSample::EState::Upload;
+        PersistKMeansState(txc, buildInfo);
+        SendUploadSampleKRequest(buildInfo);
+        return false;
     }
 
     bool FillVectorIndexSamples(TTransactionContext& txc, TIndexBuildInfo& buildInfo) {
@@ -2920,6 +3014,59 @@ struct TSchemeShard::TIndexBuilder::TTxReplyRecomputeKMeans: public TTxShardRepl
     }
 };
 
+struct TSchemeShard::TIndexBuilder::TTxReplyClusterTreeRecalculate: public TTxShardReply<TEvDataShard::TEvClusterTreeRecalculateResponse> {
+    explicit TTxReplyClusterTreeRecalculate(TSelf* self, TEvDataShard::TEvClusterTreeRecalculateResponse::TPtr& response)
+        : TTxShardReply(self, TIndexBuildId(response->Get()->Record.GetId()), response)
+    {
+    }
+
+    void HandleDone(NIceDb::TNiceDb& db, TIndexBuildInfo& buildInfo) override {
+        auto& record = Response->Get()->Record;
+        Y_UNUSED(db);
+
+        // Initialize Clusters if needed
+        if (!buildInfo.Clusters) {
+            TString error;
+            const auto& settings = std::get<NKikimrSchemeOp::TVectorIndexKmeansTreeDescription>(
+                buildInfo.SpecializedIndexDescription).GetSettings().settings();
+            buildInfo.Clusters = NKikimr::NKMeans::CreateClusters(settings, 0, error);
+            Y_ENSURE(buildInfo.Clusters);
+
+            TVector<TString> emptyClusters;
+            emptyClusters.reserve(record.ClusterIdsSize());
+            for (int i = 0; i < record.ClusterIdsSize(); i++) {
+                emptyClusters.push_back(buildInfo.Clusters->GetEmptyRow());
+            }
+            buildInfo.Clusters->SetClusters(std::move(emptyClusters));
+        }
+
+        // Merge shard results
+        Y_ENSURE(record.ClusterIdsSize() == record.ClustersSize());
+        Y_ENSURE(record.ClusterIdsSize() == record.ClusterSizesSize());
+
+        for (int i = 0; i < record.ClusterIdsSize(); i++) {
+            if (record.GetClusterSizes(i) > 0) {
+                // Find the cluster index - since we initialized with K clusters in the same order
+                // as the request ClusterIds, the index matches
+                buildInfo.Clusters->AggregateToCluster(i, record.GetClusters(i), record.GetClusterSizes(i));
+            }
+        }
+        buildInfo.Clusters->RecomputeClusters();
+
+        // Update ClusterSizes from the accumulated NextClusterSizes
+        // (RecomputeClusters updates centroids but doesn't copy sizes)
+        const auto& nextSizes = buildInfo.Clusters->GetNextClusterSizes();
+        for (ui32 i = 0; i < nextSizes.size(); i++) {
+            buildInfo.Clusters->SetClusterSize(i, nextSizes[i]);
+        }
+    }
+
+    TString ResponseShortDebugString() const override {
+        auto& record = Response->Get()->Record;
+        return ToShortDebugString(record);
+    }
+};
+
 struct TSchemeShard::TIndexBuilder::TTxReplyFilterKMeans: public TTxShardReply<TEvDataShard::TEvFilterKMeansResponse> {
     explicit TTxReplyFilterKMeans(TSelf* self, TEvDataShard::TEvFilterKMeansResponse::TPtr& response)
         : TTxShardReply(self, TIndexBuildId(response->Get()->Record.GetId()), response)
@@ -3692,6 +3839,10 @@ ITransaction* TSchemeShard::CreateTxReply(TEvDataShard::TEvBuildFulltextIndexRes
 
 ITransaction* TSchemeShard::CreateTxReply(TEvDataShard::TEvBuildFulltextDictResponse::TPtr& response) {
     return new TIndexBuilder::TTxReplyFulltextDict(this, response);
+}
+
+ITransaction* TSchemeShard::CreateTxReply(TEvDataShard::TEvClusterTreeRecalculateResponse::TPtr& response) {
+    return new TIndexBuilder::TTxReplyClusterTreeRecalculate(this, response);
 }
 
 ITransaction* TSchemeShard::CreatePipeRetry(TIndexBuildId indexBuildId, TTabletId tabletId) {
