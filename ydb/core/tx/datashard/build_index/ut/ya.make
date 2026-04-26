@@ -34,6 +34,7 @@ SRCS(
     ut_helpers.cpp
     ut_local_kmeans.cpp
     ut_prefix_kmeans.cpp
+    ut_recalculate_cluster_tree.cpp
     ut_recompute_kmeans.cpp
     ut_reshuffle_kmeans.cpp
     ut_sample_k.cpp

@@ -490,4 +490,18 @@ TString ToShortDebugString(const NKikimrTxDataShard::TEvFilterKMeansResponse& re
     return copy.ShortDebugString();
 }
 
+TString ToShortDebugString(const NKikimrTxDataShard::TEvClusterTreeRecalculateResponse& record) {
+    auto copy = record;
+    // clusters are not human readable and can be large
+    copy.ClearClusters();
+    return copy.ShortDebugString();
+}
+
+TString ToShortDebugString(const NKikimrTxDataShard::TEvClusterTreeRecalculateRequest& record) {
+    auto copy = record;
+    // clusters are not human readable and can be large
+    copy.ClearClusters();
+    return copy.ShortDebugString();
+}
+
 }

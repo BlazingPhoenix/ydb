@@ -251,6 +251,7 @@ class TDataShard
     class TTxHandleSafeFilterKMeansScan;
     class TTxHandleSafeReshuffleKMeansScan;
     class TTxHandleSafeRecomputeKMeansScan;
+    class TTxHandleSafeClusterTreeRecalculateScan;
     class TTxHandleSafeStatisticsScan;
     class TTxHandleSafeBuildFulltextIndexScan;
     class TTxHandleSafeBuildFulltextDictScan;

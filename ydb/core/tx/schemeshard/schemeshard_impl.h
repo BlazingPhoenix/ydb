@@ -1696,6 +1696,7 @@ public:
         struct TTxReplyValidateUniqueIndex;
         struct TTxReplyFulltextIndex;
         struct TTxReplyFulltextDict;
+        struct TTxReplyClusterTreeRecalculate;
 
         struct TTxPipeReset;
         struct TTxBilling;

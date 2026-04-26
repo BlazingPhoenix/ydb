@@ -1825,6 +1825,7 @@ private:
                 !buildInfo.KMeans.NeedsAnotherParent())
             {
                 buildInfo.KMeans.Parent = buildInfo.KMeans.ParentBegin;
+                buildInfo.KMeans.Child = buildInfo.KMeans.ChildBegin;
             }
             AddAllShards(buildInfo);
         }
@@ -1982,8 +1983,15 @@ private:
             }
         }
 
-        LOG_D("FillVectorIndex Done " << buildInfo.DebugString());
-        return true;
+        LOG_D("FillVectorIndex Trigger Recalculate " << buildInfo.DebugString());
+        buildInfo.KMeans.State = TIndexBuildInfo::TKMeans::Recalculate;
+        buildInfo.KMeans.Parent = buildInfo.KMeans.ParentBegin;
+        buildInfo.KMeans.Child = buildInfo.KMeans.ChildBegin;
+        buildInfo.Sample.State = TIndexBuildInfo::TSample::EState::Collect;
+        ClearDoneShards(txc, buildInfo);
+        PersistKMeansState(txc, buildInfo);
+        Progress(BuildId);
+        return false;
     }
 
     bool FillFulltextIndex(TTransactionContext& txc, TIndexBuildInfo& buildInfo) {
@@ -3034,7 +3042,7 @@ struct TSchemeShard::TIndexBuilder::TTxReplyClusterTreeRecalculate: public TTxSh
 
             TVector<TString> emptyClusters;
             emptyClusters.reserve(record.ClusterIdsSize());
-            for (int i = 0; i < record.ClusterIdsSize(); i++) {
+            for (int i = 0; i < (int)record.ClusterIdsSize(); i++) {
                 emptyClusters.push_back(buildInfo.Clusters->GetEmptyRow());
             }
             buildInfo.Clusters->SetClusters(std::move(emptyClusters));
@@ -3044,7 +3052,7 @@ struct TSchemeShard::TIndexBuilder::TTxReplyClusterTreeRecalculate: public TTxSh
         Y_ENSURE(record.ClusterIdsSize() == record.ClustersSize());
         Y_ENSURE(record.ClusterIdsSize() == record.ClusterSizesSize());
 
-        for (int i = 0; i < record.ClusterIdsSize(); i++) {
+        for (int i = 0; i < (int)record.ClusterIdsSize(); i++) {
             if (record.GetClusterSizes(i) > 0) {
                 // Find the cluster index - since we initialized with K clusters in the same order
                 // as the request ClusterIds, the index matches

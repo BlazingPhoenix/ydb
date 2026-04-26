@@ -413,7 +413,7 @@ public:
     TString GetEmptyRow() const override {
         TString str;
         const size_t bufferSize = NKnnVectorSerialization::GetBufferSize<TCoord>(Dimensions);
-        str.resize(bufferSize);
+        str.resize(bufferSize, '\0');
         str[bufferSize - HeaderLen] = FormatByte;
         if (IsBitQuantized()) {
             str[bufferSize - HeaderLen - 1] = 8 - Dimensions % 8;
