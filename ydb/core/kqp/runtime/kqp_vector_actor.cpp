@@ -27,6 +27,7 @@ using namespace NKikimr::NDataShard;
 class TKqpVectorResolveActor : public NActors::TActorBootstrapped<TKqpVectorResolveActor>, public NYql::NDq::IDqComputeActorAsyncInput {
 
     static constexpr ui32 MaxSearchWidth = 100;
+    static constexpr double DistancePruningFactor = 2.0;
 
 public:
     TKqpVectorResolveActor(
@@ -182,6 +183,10 @@ private:
             std::max(OverlapClusters, static_cast<ui32>(std::min<ui64>(UserLimit, MaxSearchWidth))));
     }
 
+    static double ComputeDistanceThreshold(double bestDist, double factor) {
+        return bestDist < 0 ? bestDist / factor : bestDist * factor;
+    }
+
     void ContinueResolveClusters() {
         if (Failed) {
             return;
@@ -217,7 +222,13 @@ private:
                     }
                 } else {
                     for (size_t i = 0; i < PendingRows.size(); i++) {
-                        for (auto cl: PrevClusters[i]) {
+                        if (PrevClusters[i].empty()) continue;
+                        double bestDist = PrevClusters[i].front().second;
+                        double threshold = UserLimit > 0
+                            ? ComputeDistanceThreshold(bestDist, DistancePruningFactor)
+                            : std::numeric_limits<double>::max();
+                        for (const auto& cl : PrevClusters[i]) {
+                            if (cl.second > threshold) break; // sorted, rest are farther
                             if (!NKikimr::NTableIndex::NKMeans::HasPostingParentFlag(cl.first)) {
                                 LevelClusters[cl.first].push_back(i);
                             } else {
@@ -267,6 +278,18 @@ private:
         for (auto& rowClusters : PrevClusters) {
             std::sort(rowClusters.begin(), rowClusters.end(),
                 [](const auto& a, const auto& b) { return a.second > b.second; });
+        }
+        if (UserLimit > 0) {
+            for (auto& rowClusters : PrevClusters) {
+                if (rowClusters.size() <= 1) continue;
+                double bestDist = rowClusters.back().second;
+                double threshold = ComputeDistanceThreshold(bestDist, DistancePruningFactor);
+                auto it = std::find_if(rowClusters.begin(), rowClusters.end(),
+                    [threshold](const auto& c) { return c.second <= threshold; });
+                if (it != rowClusters.begin()) {
+                    rowClusters.erase(rowClusters.begin(), it);
+                }
+            }
         }
         if (!Failed) {
             NotifyCA();
