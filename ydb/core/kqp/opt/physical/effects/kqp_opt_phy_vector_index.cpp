@@ -47,6 +47,7 @@ TExprBase BuildVectorIndexPostingRows(const TKikimrTableDescription& table,
         .InputType(ExpandType(pos, *resolveInputType, ctx))
         .Index(ctx.NewAtom(pos, indexName))
         .WithData(ctx.NewAtom(pos, withData ? "true" : "false"))
+        .UserLimit(ctx.NewAtom(pos, "0"))
         .Done();
 
     auto resolveStage = Build<TDqStage>(ctx, pos)

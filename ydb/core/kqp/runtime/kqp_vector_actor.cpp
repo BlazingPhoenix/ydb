@@ -42,6 +42,7 @@ public:
         , IsPrefixed(Settings.HasRootClusterColumnIndex())
         , OverlapClusters(Settings.GetOverlapClusters() > 0 ? Settings.GetOverlapClusters() : 1)
         , OverlapRatio(Settings.GetOverlapRatio())
+        , UserLimit(Settings.GetUserLimit())
         , LogPrefix(TStringBuilder() << "VectorResolveActor, inputIndex: " << inputIndex << ", CA Id " << computeActorId)
         , InputIndex(inputIndex)
         , Input(input)
@@ -551,6 +552,7 @@ private:
     const bool IsPrefixed;
     const ui32 OverlapClusters;
     const double OverlapRatio;
+    const ui64 UserLimit;
     const TString LogPrefix;
     const ui64 InputIndex;
     NUdf::TUnboxedValue Input;

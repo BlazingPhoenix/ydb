@@ -336,6 +336,9 @@ message TKqpPhyCnVectorResolve {
     optional uint32 RootClusterColumnIndex = 10;
     optional uint32 OverlapClusters = 11;
     optional double OverlapRatio = 12;
+
+    // User's query LIMIT for adaptive cluster expansion
+    optional uint64 UserLimit = 13;
 }
 
 message TKqpPhyCnSequencer {

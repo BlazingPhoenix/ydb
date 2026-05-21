@@ -2438,6 +2438,14 @@ private:
             vectorResolveProto.SetOverlapClusters(kmeansDesc.GetSettings().overlap_clusters());
             vectorResolveProto.SetOverlapRatio(kmeansDesc.GetSettings().overlap_ratio());
 
+            ui64 userLimit = 0;
+            if (auto limitStr = vectorResolve.UserLimit().Value(); limitStr) {
+                TryFromString(limitStr, userLimit);
+            }
+            if (userLimit > 0) {
+                vectorResolveProto.SetUserLimit(userLimit);
+            }
+
             // Main table
             FillTablesMap(vectorResolve.Table(), tablesMap);
             FillTableId(vectorResolve.Table(), *vectorResolveProto.MutableTable());

@@ -363,6 +363,9 @@ message TKqpVectorResolveSettings {
     optional uint64 QuerySpanId = 20;
 
     optional string PoolId = 21;
+
+    // User's query LIMIT for adaptive cluster expansion
+    optional uint64 UserLimit = 22;
 }
 
 message TKqpTaskInfo {

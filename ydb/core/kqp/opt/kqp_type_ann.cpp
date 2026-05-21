@@ -2374,7 +2374,7 @@ TStatus AnnotateStreamLookupConnection(const TExprNode::TPtr& node, TExprContext
 TStatus AnnotateVectorResolveConnection(const TExprNode::TPtr& node, TExprContext& ctx, const TString& cluster,
     const TKikimrTablesData& tablesData) {
 
-    if (!EnsureArgsCount(*node, 5, ctx)) {
+    if (!EnsureArgsCount(*node, 6, ctx)) {
         return TStatus::Error;
     }
 
