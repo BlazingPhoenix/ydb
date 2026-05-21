@@ -14,6 +14,8 @@
 
 #include <util/string/vector.h>
 
+#include <algorithm>
+
 namespace NKikimr {
 namespace NKqp {
 
@@ -23,6 +25,8 @@ using namespace NKikimr;
 using namespace NKikimr::NDataShard;
 
 class TKqpVectorResolveActor : public NActors::TActorBootstrapped<TKqpVectorResolveActor>, public NYql::NDq::IDqComputeActorAsyncInput {
+
+    static constexpr ui32 MaxSearchWidth = 100;
 
 public:
     TKqpVectorResolveActor(
@@ -43,6 +47,7 @@ public:
         , OverlapClusters(Settings.GetOverlapClusters() > 0 ? Settings.GetOverlapClusters() : 1)
         , OverlapRatio(Settings.GetOverlapRatio())
         , UserLimit(Settings.GetUserLimit())
+        , SearchWidth(ComputeSearchWidth())
         , LogPrefix(TStringBuilder() << "VectorResolveActor, inputIndex: " << inputIndex << ", CA Id " << computeActorId)
         , InputIndex(inputIndex)
         , Input(input)
@@ -169,6 +174,14 @@ private:
         return status;
     }
 
+    ui32 ComputeSearchWidth() const {
+        if (UserLimit == 0) {
+            return OverlapClusters;
+        }
+        return std::min<ui32>(MaxSearchWidth,
+            std::max(OverlapClusters, static_cast<ui32>(std::min<ui64>(UserLimit, MaxSearchWidth))));
+    }
+
     void ContinueResolveClusters() {
         if (Failed) {
             return;
@@ -235,7 +248,7 @@ private:
                         // Skip invalid values, the only legitimate one here is NULL
                         continue;
                     }
-                    clusters->FindClusters(embedding.AsStringRef(), TmpClusters, OverlapClusters, OverlapRatio);
+                    clusters->FindClusters(embedding.AsStringRef(), TmpClusters, SearchWidth, OverlapRatio);
                     for (auto& cluster: TmpClusters) {
                         NextClusters[rowNum].push_back(std::make_pair(clusterIds[cluster.first], cluster.second));
                     }
@@ -243,13 +256,17 @@ private:
                 CurClusters.reset();
                 LevelClusters.erase(cluster);
             }
-            if (OverlapClusters > 1) {
+            if (SearchWidth > 1) {
                 for (auto& rowClusters: NextClusters) {
-                    NKMeans::FilterOverlapRows(rowClusters, OverlapClusters, OverlapRatio);
+                    NKMeans::FilterOverlapRows(rowClusters, SearchWidth, OverlapRatio);
                 }
             }
             PrevClusters = std::move(NextClusters);
             ResolvedLevel++;
+        }
+        for (auto& rowClusters : PrevClusters) {
+            std::sort(rowClusters.begin(), rowClusters.end(),
+                [](const auto& a, const auto& b) { return a.second > b.second; });
         }
         if (!Failed) {
             NotifyCA();
@@ -428,7 +445,6 @@ private:
         }
         FetchedClusters.clear();
         if (!ReadingChildClustersOf) {
-            // Cache root clusters in RootClusters for future batches
             RootClusters = std::move(clusters);
             RootClusterIds = std::move(clusterIds);
         } else {
@@ -553,6 +569,7 @@ private:
     const ui32 OverlapClusters;
     const double OverlapRatio;
     const ui64 UserLimit;
+    ui32 SearchWidth;
     const TString LogPrefix;
     const ui64 InputIndex;
     NUdf::TUnboxedValue Input;
