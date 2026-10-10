@@ -3567,6 +3567,8 @@ Y_UNIT_TEST_SUITE(BackupRestore) {
             case EIndexTypeGlobalFulltextCompactRelevance:
             case EIndexTypeGlobalJsonCompact:
                 return TestTableWithIndexBackupRestore(Value);
+            case EIndexTypeGlobalHnsw:
+                break; // The public table API has no representation for this internal index type.
             case EIndexTypeLocalBloomFilter:
             case EIndexTypeLocalBloomNgramFilter:
             case EIndexTypeLocalMinMax:
@@ -5059,6 +5061,8 @@ Y_UNIT_TEST_SUITE(BackupRestoreS3) {
             case EIndexTypeGlobalJsonCompact:
                 TestTableWithIndexBackupRestore(Value);
                 break;
+            case EIndexTypeGlobalHnsw:
+                break; // The public table API has no representation for this internal index type.
             case EIndexTypeLocalBloomFilter:
             case EIndexTypeLocalBloomNgramFilter:
             case EIndexTypeLocalMinMax:
