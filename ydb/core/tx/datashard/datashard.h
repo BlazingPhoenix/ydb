@@ -1751,7 +1751,7 @@ namespace TEvDataShard {
     };
 
     struct TEvSampleKResponse
-        : public TEventPB<TEvSampleKResponse,
+        : public TMemoryReservation, public TEventPB<TEvSampleKResponse,
                           NKikimrTxDataShard::TEvSampleKResponse,
                           TEvDataShard::EvSampleKResponse> {
     };
@@ -1763,7 +1763,7 @@ namespace TEvDataShard {
     };
 
     struct TEvReshuffleKMeansResponse
-        : public TEventPB<TEvReshuffleKMeansResponse,
+        : public TMemoryReservation, public TEventPB<TEvReshuffleKMeansResponse,
                           NKikimrTxDataShard::TEvReshuffleKMeansResponse,
                           TEvDataShard::EvReshuffleKMeansResponse> {
     };
@@ -1775,7 +1775,7 @@ namespace TEvDataShard {
     };
 
     struct TEvRecomputeKMeansResponse
-        : public TEventPB<TEvRecomputeKMeansResponse,
+        : public TMemoryReservation, public TEventPB<TEvRecomputeKMeansResponse,
                           NKikimrTxDataShard::TEvRecomputeKMeansResponse,
                           TEvDataShard::EvRecomputeKMeansResponse> {
     };
@@ -1787,7 +1787,7 @@ namespace TEvDataShard {
     };
 
     struct TEvLocalKMeansResponse
-        : public TEventPB<TEvLocalKMeansResponse,
+        : public TMemoryReservation, public TEventPB<TEvLocalKMeansResponse,
                           NKikimrTxDataShard::TEvLocalKMeansResponse,
                           TEvDataShard::EvLocalKMeansResponse> {
     };
@@ -1799,7 +1799,7 @@ namespace TEvDataShard {
     };
 
     struct TEvPrefixKMeansResponse
-        : public TEventPB<TEvPrefixKMeansResponse,
+        : public TMemoryReservation, public TEventPB<TEvPrefixKMeansResponse,
                           NKikimrTxDataShard::TEvPrefixKMeansResponse,
                           TEvDataShard::EvPrefixKMeansResponse> {
     };
@@ -1823,7 +1823,7 @@ namespace TEvDataShard {
     };
 
     struct TEvFilterKMeansResponse
-        : public TEventPB<TEvFilterKMeansResponse,
+        : public TMemoryReservation, public TEventPB<TEvFilterKMeansResponse,
                           NKikimrTxDataShard::TEvFilterKMeansResponse,
                           TEvDataShard::EvFilterKMeansResponse> {
     };

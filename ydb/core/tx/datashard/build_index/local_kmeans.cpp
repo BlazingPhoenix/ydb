@@ -48,7 +48,7 @@ using namespace NKMeans;
  *     - Output: rows annotated with cluster IDs and optional data columns
  */
 
-class TLocalKMeansScan: public TActor<TLocalKMeansScan>, public IActorExceptionHandler, public NTable::IScan {
+class TLocalKMeansScan: public TActor<TLocalKMeansScan>, public IActorExceptionHandler, public TVectorIndexScan {
 protected:
     using EState = NKikimrTxDataShard::EKMeansState;
 
@@ -188,6 +188,7 @@ public:
 
         Driver = driver;
         Uploader.SetOwner(SelfId());
+        Uploader.SetResourceReservation(GetResourceReservation(), GetResourceRetainer());
 
         return {EScan::Feed, {}};
     }
@@ -227,6 +228,10 @@ public:
             YDB_LOG_ERROR("Scan failed",
                 {"debug", Debug()},
                 {"responseRecord", Response->Record.ShortDebugString()});
+        }
+        if (GetResourceReservation()) {
+            Response->MemoryReservation = RetainResourceReservation(
+                Response->Record.SpaceUsedLong() + Response->Record.ByteSizeLong() + 4_KB);
         }
         Send(ResponseActorId, Response.Release());
 
@@ -275,6 +280,10 @@ public:
 
     EScan Feed(TArrayRef<const TCell> key, const TRow& row) final
     {
+        if (!CheckRowBytes(Response->Record, key, *row)) {
+            return EScan::Final;
+        }
+
         ++ReadRows;
         ReadBytes += CountRowCellBytes(key, *row);
 
@@ -796,13 +805,16 @@ void TDataShard::HandleSafe(TEvDataShard::TEvLocalKMeansRequest::TPtr& ev, const
             Y_ENSURE(sent);
             return;
         }
-        NTable::TLead lead;
-        TString preparationError;
-        Y_ENSURE(PrepareLocalKMeansLead(userTable, request, &lead, preparationError), preparationError);
-        auto clusters = PrepareKMeansClusters(request, NKikimr::NKMeans::EClustersMode::Accumulate, true, error);
-        Y_ENSURE(clusters || NKikimr::NKMeans::ValidateSettingsPartial(request.GetSettings(), error), error);
-        TAutoPtr<NTable::IScan> scan = new TLocalKMeansScan(TabletID(), userTable, request, sender, std::move(response), std::move(lead), std::move(clusters));
-        StartScan(this, std::move(scan), id, seqNo, rowVersion, userTable.LocalTid);
+        StartDeferredBuildIndexScan<TEvDataShard::TEvLocalKMeansRequest, TEvDataShard::TEvLocalKMeansResponse>(
+            this, ev, std::move(response), rowVersion, userTable.LocalTid,
+            [tabletId = TabletID()](const TUserTable& table, const auto& req, TActorId sender, auto reply) -> TAutoPtr<NTable::IScan> {
+                NTable::TLead lead;
+                TString error;
+                Y_ENSURE(PrepareLocalKMeansLead(table, req, &lead, error), error);
+                auto clusters = PrepareKMeansClusters(req, NKikimr::NKMeans::EClustersMode::Accumulate, true, error);
+                Y_ENSURE(clusters || NKikimr::NKMeans::ValidateSettingsPartial(req.GetSettings(), error), error);
+                return new TLocalKMeansScan(tabletId, table, req, sender, std::move(reply), std::move(lead), std::move(clusters));
+            });
     } catch (const std::exception& exc) {
         FailScan<TEvDataShard::TEvLocalKMeansResponse>(id, TabletID(), sender, seqNo, exc, "TLocalKMeansScan");
     }

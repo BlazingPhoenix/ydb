@@ -48,7 +48,7 @@ using namespace NKMeans;
  *   - The row and any specified data columns are written to the output table
  */
 
-class TReshuffleKMeansScan: public TActor<TReshuffleKMeansScan>, public IActorExceptionHandler, public NTable::IScan {
+class TReshuffleKMeansScan: public TActor<TReshuffleKMeansScan>, public IActorExceptionHandler, public TVectorIndexScan {
 protected:
     using EState = NKikimrTxDataShard::EKMeansState;
 
@@ -158,6 +158,7 @@ public:
 
         Driver = driver;
         Uploader.SetOwner(SelfId());
+        Uploader.SetResourceReservation(GetResourceReservation(), GetResourceRetainer());
 
         return {EScan::Feed, {}};
     }
@@ -201,6 +202,10 @@ public:
             YDB_LOG_ERROR("Scan failed",
                 {"debug", Debug()},
                 {"responseRecord", Response->Record.ShortDebugString()});
+        }
+        if (GetResourceReservation()) {
+            Response->MemoryReservation = RetainResourceReservation(
+                Response->Record.SpaceUsedLong() + Response->Record.ByteSizeLong() + 4_KB);
         }
         Send(ResponseActorId, Response.Release());
 
@@ -249,6 +254,10 @@ public:
 
     EScan Feed(TArrayRef<const TCell> key, const TRow& row) final
     {
+        if (!CheckRowBytes(Response->Record, key, *row)) {
+            return EScan::Final;
+        }
+
         ++ReadRows;
         ReadBytes += CountRowCellBytes(key, *row);
 
@@ -566,13 +575,16 @@ void TDataShard::HandleSafe(TEvDataShard::TEvReshuffleKMeansRequest::TPtr& ev, c
             return;
         }
 
-        NTable::TLead lead;
-        TString preparationError;
-        Y_ENSURE(PrepareParentKMeansLead(userTable, request, &lead, preparationError), preparationError);
-        auto clusters = PrepareKMeansClusters(request, NKikimr::NKMeans::EClustersMode::AssignOnly, true, error);
-        Y_ENSURE(clusters, error);
-        TAutoPtr<NTable::IScan> scan = new TReshuffleKMeansScan(TabletID(), userTable, std::move(lead), request, sender, std::move(response), std::move(clusters));
-        StartScan(this, std::move(scan), id, seqNo, rowVersion, userTable.LocalTid);
+        StartDeferredBuildIndexScan<TEvDataShard::TEvReshuffleKMeansRequest, TEvDataShard::TEvReshuffleKMeansResponse>(
+            this, ev, std::move(response), rowVersion, userTable.LocalTid,
+            [tabletId = TabletID()](const TUserTable& table, const auto& req, TActorId sender, auto reply) -> TAutoPtr<NTable::IScan> {
+                NTable::TLead lead;
+                TString error;
+                Y_ENSURE(PrepareParentKMeansLead(table, req, &lead, error), error);
+                auto clusters = PrepareKMeansClusters(req, NKikimr::NKMeans::EClustersMode::AssignOnly, true, error);
+                Y_ENSURE(clusters, error);
+                return new TReshuffleKMeansScan(tabletId, table, std::move(lead), req, sender, std::move(reply), std::move(clusters));
+            });
     } catch (const std::exception& exc) {
         FailScan<TEvDataShard::TEvReshuffleKMeansResponse>(id, TabletID(), sender, seqNo, exc, "TReshuffleKMeansScan");
     }
