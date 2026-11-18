@@ -690,6 +690,7 @@ void TDataShard::Handle(TEvDataShard::TEvPrefixKMeansRequest::TPtr& ev, const TA
 
 void TDataShard::HandleSafe(TEvDataShard::TEvPrefixKMeansRequest::TPtr& ev, const TActorContext& ctx)
 {
+    const auto sender = ev->Sender;
     auto& request = ev->Get()->Record;
     const ui64 id = request.GetId();
     TRowVersion rowVersion = GetMvccTxVersion(EMvccTxMode::ReadOnly);
@@ -797,20 +798,19 @@ void TDataShard::HandleSafe(TEvDataShard::TEvPrefixKMeansRequest::TPtr& ev, cons
 
         // 3. Validating vector index settings
         TString error;
-        auto clusters = NKikimr::NKMeans::CreateClusters(request.GetSettings(), request.GetNeedsRounds(), error);
-        if (!clusters && !NKikimr::NKMeans::ValidateSettingsPartial(request.GetSettings(), error)) {
+        if (!NKikimr::NKMeans::ValidateSettings(request.GetSettings(), error) &&
+            !NKikimr::NKMeans::ValidateSettingsPartial(request.GetSettings(), error)) {
             badRequest(error);
             auto sent = trySendBadRequest();
             Y_ENSURE(sent);
             return;
         }
-        TAutoPtr<NTable::IScan> scan = new TPrefixKMeansScan(
-            TabletID(), userTable, request, ev->Sender, std::move(response), std::move(clusters)
-        );
-
+        auto clusters = PrepareKMeansClusters(request, NKikimr::NKMeans::EClustersMode::Accumulate, true, error);
+        Y_ENSURE(clusters || NKikimr::NKMeans::ValidateSettingsPartial(request.GetSettings(), error), error);
+        TAutoPtr<NTable::IScan> scan = new TPrefixKMeansScan(TabletID(), userTable, request, sender, std::move(response), std::move(clusters));
         StartScan(this, std::move(scan), id, seqNo, rowVersion, userTable.LocalTid);
     } catch (const std::exception& exc) {
-        FailScan<TEvDataShard::TEvPrefixKMeansResponse>(id, TabletID(), ev->Sender, seqNo, exc, "TPrefixKMeansScan");
+        FailScan<TEvDataShard::TEvPrefixKMeansResponse>(id, TabletID(), sender, seqNo, exc, "TPrefixKMeansScan");
     }
 }
 
