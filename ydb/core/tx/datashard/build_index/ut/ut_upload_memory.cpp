@@ -14,12 +14,82 @@
 #include <ydb/core/tx/tx_proxy/upload_rows.h>
 
 #include <contrib/libs/tcmalloc/tcmalloc/malloc_extension.h>
+#include <library/cpp/testing/common/env.h>
+#include <ydb/library/testlib/helpers.h>
 
 #include <util/generic/hash_set.h>
 #include <util/generic/size_literals.h>
+#include <util/stream/file.h>
+#include <util/stream/format.h>
+#include <util/string/cast.h>
+#include <util/system/mem_info.h>
 
 namespace NKikimr {
 namespace {
+
+class THeapSamplingScope {
+public:
+    THeapSamplingScope() {
+        if (Enabled) {
+            // A small interval wastes entire allocator pages on sampled small
+            // allocations. Use a separate, unsampled run for byte/RSS totals.
+            tcmalloc::MallocExtension::SetProfileSamplingInterval(Profile ? 2_MB : 0);
+        }
+    }
+
+    ~THeapSamplingScope() {
+        if (Enabled) {
+            tcmalloc::MallocExtension::SetProfileSamplingInterval(OldInterval);
+        }
+    }
+
+private:
+    const bool Profile = GetTestParam("vector-upload-profile") == "true";
+    const bool Enabled = Profile || GetTestParam("vector-upload-measure") == "true";
+    const i64 OldInterval = tcmalloc::MallocExtension::GetProfileSamplingInterval();
+};
+
+// Opt in with --test-param vector-upload-profile=true. Each line contains
+// estimated live bytes, estimated object count, and allocation stack PCs.
+// Keep the raw PCs so llvm-symbolizer can resolve inlined frames offline.
+void DumpUploadHeap(const TString& stage) {
+    const bool profileEnabled = GetTestParam("vector-upload-profile") == "true";
+    if (!profileEnabled && GetTestParam("vector-upload-measure") != "true") {
+        return;
+    }
+    const auto allocated = tcmalloc::MallocExtension::GetNumericProperty("generic.current_allocated_bytes");
+    const auto physical = tcmalloc::MallocExtension::GetNumericProperty("generic.physical_memory_used");
+    const auto rss = NMemInfo::GetMemInfo().RSS;
+    Cerr << "VECTOR_INDEX_MEMORY stage=" << stage
+         << " allocated=" << allocated.value_or(0)
+         << " physical=" << physical.value_or(0)
+         << " rss=" << rss << Endl;
+    {
+        TFileOutput stats(GetOutputPath() / (stage + ".stats.tsv"));
+        stats << "allocated\t" << allocated.value_or(0) << '\n'
+              << "physical\t" << physical.value_or(0) << '\n'
+              << "rss\t" << rss << '\n';
+    }
+    if (!profileEnabled) {
+        return;
+    }
+#if defined(__linux__)
+    {
+        TFileInput maps("/proc/self/maps");
+        TFileOutput out(GetOutputPath() / (stage + ".maps"));
+        out << maps.ReadAll();
+    }
+#endif
+    TFileOutput out(GetOutputPath() / (stage + ".heap.tsv"));
+    auto profile = tcmalloc::MallocExtension::SnapshotCurrent(tcmalloc::ProfileType::kHeap);
+    profile.Iterate([&](const tcmalloc::Profile::Sample& sample) {
+        out << sample.sum << '\t' << sample.count;
+        for (int i = 0; i < sample.depth; ++i) {
+            out << '\t' << Hex(reinterpret_cast<uintptr_t>(sample.stack[i]), HF_ADDX);
+        }
+        out << '\n';
+    });
+}
 
 class TAdmissionFixture {
 public:
@@ -1451,6 +1521,274 @@ Y_UNIT_TEST_SUITE(TVectorIndexUploadMemory) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Usage().Count, 0);
     }
 
+    // Reproduces #56118 without exhausting the host: all scans are on one node,
+    // and shard requests are held while each scan fills its next output batch.
+    // Scale with vector-upload-scans and vector-upload-batch-bytes parameters.
+    Y_UNIT_TEST(ConcurrentReshuffleWithBlockedUploads) {
+        using namespace Tests;
+        const ui32 scans = FromString<ui32>(GetTestParam("vector-upload-scans", "4"));
+        const ui64 batchBytes = FromString<ui64>(GetTestParam("vector-upload-batch-bytes", ToString(8_MB)));
+        // Stay below the default queue_build_index CPU limit of ten scans.
+        UNIT_ASSERT(scans > 0 && scans <= 8);
+        UNIT_ASSERT(batchBytes >= 64_KB && batchBytes <= 8_MB);
+        constexpr ui32 payloadBytes = 16_KB;
+        // Leave enough rows for two full batches and an unprocessed tail.
+        const ui32 rowsPerShard = 2 * (batchBytes / payloadBytes + 1) + 32;
+
+        THeapSamplingScope sampling;
+
+        TPortManager pm;
+        TServerSettings settings(pm.GetPort(2134));
+        settings.SetDomainName("Root");
+        settings.SetUseRealThreads(false);
+        TServer::TPtr server = new TServer(settings);
+        auto& runtime = *server->GetRuntime();
+        const auto sender = runtime.AllocateEdgeActor();
+        InitRoot(server, sender);
+        CreateMainTable(server, sender, TShardedTableOptions().Shards(scans));
+        CreatePostingTable(server, sender, TShardedTableOptions().Shards(1));
+        const auto shards = GetTableShards(server, sender, "/Root/table-main");
+        const auto tableId = ResolveTableId(server, sender, "/Root/table-main");
+        UNIT_ASSERT_VALUES_EQUAL(shards.size(), scans);
+
+        // Load through the real upload path, outside the profiled interval.
+        // Uniform Uint32 partitioning puts exactly rowsPerShard rows per scan.
+        {
+            auto types = std::make_shared<NTxProxy::TUploadTypes>();
+            for (const auto& [name, id] : TVector<std::pair<TString, Ydb::Type::PrimitiveTypeId>>{
+                    {"key", Ydb::Type::UINT32}, {"embedding", Ydb::Type::STRING}, {"data", Ydb::Type::STRING}}) {
+                Ydb::Type type;
+                type.set_type_id(id);
+                types->emplace_back(name, type);
+            }
+            const TString embedding("ab\2");
+            const TString payload(payloadBytes, 'x');
+            const TVector<TCell> values{TCell(embedding.data(), embedding.size()), TCell(payload.data(), payload.size())};
+            for (ui32 shard = 0; shard < scans; ++shard) {
+                auto rows = std::make_shared<NTxProxy::TUploadRows>();
+                for (ui32 row = 0; row < rowsPerShard; ++row) {
+                    const ui32 key = ((ui64(1) << 32) * shard + scans - 1) / scans + row;
+                    const TVector<TCell> keys{TCell::Make(key)};
+                    rows->emplace_back(TSerializedCellVec(keys), TSerializedCellVec::Serialize(values));
+                }
+                runtime.Register(NTxProxy::CreateUploadRowsInternal(
+                    sender, "/Root", "/Root/table-main", types, std::move(rows)));
+                const auto reply = runtime.GrabEdgeEventRethrow<TEvTxUserProxy::TEvUploadRowsResponse>(sender);
+                UNIT_ASSERT_VALUES_EQUAL_C(reply->Get()->Status, Ydb::StatusIds::SUCCESS, reply->Get()->Issues.ToString());
+            }
+        }
+        const auto snapshot = CreateVolatileSnapshot(server, {"/Root/table-main"});
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        DumpUploadHeap("baseline");
+
+        const bool admission = GetTestParam("vector-upload-admission") == "true";
+        ui32 scanSubmissions = 0;
+        ui64 reservationBytes = 0;
+        auto brokerObserver = runtime.AddObserver<NResourceBroker::TEvResourceBroker::TEvSubmitTask>([&](auto& event) {
+            if (event->Get()->Task.Type == "build_index") {
+                ++scanSubmissions;
+                reservationBytes = event->Get()->Task.RequiredResources[NKikimrResourceBroker::MEMORY];
+            }
+        });
+        TBlockEvents<TEvDataShard::TEvUploadRowsRequest> uploads(runtime);
+        for (const ui64 shard : shards) {
+            auto request = MakeHolder<TEvDataShard::TEvReshuffleKMeansRequest>();
+            auto& rec = request->Record;
+            rec.SetAllowMemoryAdmission(GetTestParam("vector-upload-admission") == "true");
+            rec.SetId(1);
+            rec.SetSeqNoGeneration(1);
+            rec.SetSeqNoRound(1);
+            rec.SetTabletId(shard);
+            tableId.PathId.ToProto(rec.MutablePathId());
+            rec.SetSnapshotTxId(snapshot.TxId);
+            rec.SetSnapshotStep(snapshot.Step);
+            rec.MutableSettings()->set_vector_dimension(2);
+            rec.MutableSettings()->set_vector_type(Ydb::Table::VectorIndexSettings::VECTOR_TYPE_UINT8);
+            rec.MutableSettings()->set_metric(Ydb::Table::VectorIndexSettings::DISTANCE_COSINE);
+            rec.SetUpload(NKikimrTxDataShard::UPLOAD_MAIN_TO_POSTING);
+            rec.SetParent(0);
+            rec.SetChild(1);
+            rec.AddClusters("ab\2");
+            rec.SetEmbeddingColumn("embedding");
+            rec.AddDataColumns("data");
+            rec.SetDatabaseName("/Root");
+            rec.SetOutputName("/Root/table-posting");
+            rec.MutableScanSettings()->SetMaxBatchBytes(batchBytes);
+            runtime.SendToPipe(shard, sender, request.Release(), 0, GetPipeConfigWithRetries());
+        }
+        runtime.WaitFor("all scan requests submitted", [&] { return scanSubmissions == scans; }, TDuration::Seconds(30));
+        runtime.Send(new IEventHandle(NResourceBroker::MakeResourceBrokerID(), sender,
+            new NResourceBroker::TEvResourceBroker::TEvConfigRequest("queue_build_index")));
+        const auto brokerConfig = runtime.GrabEdgeEventRethrow<NResourceBroker::TEvResourceBroker::TEvConfigResponse>(sender);
+        const ui64 activeMemoryLimit = brokerConfig->Get()->QueueConfig->GetLimit().GetMemory();
+        const ui32 active = admission ? Min<ui64>(scans, activeMemoryLimit / reservationBytes) : scans;
+        UNIT_ASSERT_GT(active, 0);
+        runtime.WaitFor("one blocked upload per admitted scan", [&] { return uploads.size() >= active; }, TDuration::Seconds(30));
+        // Let scans fill their second buffers and go to sleep on backpressure.
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(uploads.size(), active);
+        THashSet<TActorId> uploaders;
+        ui64 requestBytes = 0;
+        for (const auto& ev : uploads) {
+            UNIT_ASSERT(uploaders.insert(ev->Sender).second);
+            ui64 bytes = 0;
+            for (const auto& row : ev->Get()->Record.GetRows()) {
+                bytes += row.GetKeyColumns().size() + row.GetValueColumns().size();
+            }
+            UNIT_ASSERT_GT(bytes, batchBytes);
+            UNIT_ASSERT_LE(bytes, batchBytes + payloadBytes + 128);
+            requestBytes += bytes;
+        }
+        Cerr << "VECTOR_UPLOAD_MEMORY scans=" << scans << " active=" << active << " reservation_bytes=" << reservationBytes << " batch_bytes=" << batchBytes
+             << " rows_per_shard=" << rowsPerShard << " blocked_request_bytes=" << requestBytes << Endl;
+        DumpUploadHeap("blocked");
+
+        // More elapsed time cannot start another upload while the first is held.
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(uploads.size(), active);
+        uploads.Stop().Unblock();
+        ui64 readRows = 0;
+        ui64 uploadRows = 0;
+        THashSet<ui64> completed;
+        while (completed.size() < scans) {
+            const auto reply = runtime.GrabEdgeEventRethrow<TEvDataShard::TEvReshuffleKMeansResponse>(sender);
+            const auto& rec = reply->Get()->Record;
+            if (rec.GetStatus() == NKikimrIndexBuilder::IN_PROGRESS) {
+                continue;
+            }
+            UNIT_ASSERT_VALUES_EQUAL_C(rec.GetStatus(), NKikimrIndexBuilder::DONE, rec.ShortDebugString());
+            UNIT_ASSERT(completed.insert(rec.GetTabletId()).second);
+            UNIT_ASSERT_VALUES_EQUAL(rec.GetMeteringStats().GetReadRows(), rowsPerShard);
+            UNIT_ASSERT_VALUES_EQUAL(rec.GetMeteringStats().GetUploadRows(), rowsPerShard);
+            readRows += rec.GetMeteringStats().GetReadRows();
+            uploadRows += rec.GetMeteringStats().GetUploadRows();
+        }
+        UNIT_ASSERT_VALUES_EQUAL(readRows, ui64(scans) * rowsPerShard);
+        UNIT_ASSERT_VALUES_EQUAL(uploadRows, readRows);
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        DumpUploadHeap("finished");
+        UNIT_ASSERT_VALUES_EQUAL(NDataShard::NKqpHelpers::KqpSimpleExecSuccess(runtime,
+            "SELECT COUNT(*) FROM `/Root/table-posting`;"),
+            TStringBuilder() << "{ items { uint64_value: " << uploadRows << " } }");
+    }
+
+    Y_UNIT_TEST(ReshuffleCentroidsBeforeAdmission) {
+        using namespace Tests;
+        // Hold real scan submissions before resource-broker admission. The
+        // empty source isolates centroid state from row data and upload buffers.
+        const ui32 scans = FromString<ui32>(GetTestParam("vector-centroid-scans", "32"));
+        const ui32 dimensions = FromString<ui32>(GetTestParam("vector-centroid-dimensions", "1536"));
+        const ui32 count = FromString<ui32>(GetTestParam("vector-centroid-clusters", "256"));
+        const bool distinctPayloads = GetTestParam("vector-centroid-distinct-payloads") == "true";
+        const bool admission = GetTestParam("vector-upload-admission") == "true";
+        UNIT_ASSERT(scans > 0 && scans <= (admission ? 128 : 32));
+        UNIT_ASSERT(dimensions > 0 && dimensions <= 4096);
+        UNIT_ASSERT(count > 0 && count <= 1024);
+        THeapSamplingScope sampling;
+
+        TPortManager pm;
+        TServerSettings settings(pm.GetPort(2134));
+        settings.SetDomainName("Root");
+        settings.SetUseRealThreads(false);
+        TServer::TPtr server = new TServer(settings);
+        auto& runtime = *server->GetRuntime();
+        const auto sender = runtime.AllocateEdgeActor();
+        InitRoot(server, sender);
+        CreateMainTable(server, sender, TShardedTableOptions().Shards(scans));
+        CreatePostingTable(server, sender, TShardedTableOptions().Shards(1));
+        const auto shards = GetTableShards(server, sender, "/Root/table-main");
+        const auto tableId = ResolveTableId(server, sender, "/Root/table-main");
+        const auto snapshot = CreateVolatileSnapshot(server, {"/Root/table-main"});
+        UNIT_ASSERT_VALUES_EQUAL(shards.size(), scans);
+        TString centroid(dimensions, 'a');
+        centroid.push_back('\2');
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        DumpUploadHeap("centroids-baseline");
+
+        ui32 uploadRequests = 0;
+        THashSet<ui64> rejected;
+        auto rejectionObserver = runtime.AddObserver<TEvDataShard::TEvReshuffleKMeansResponse>([&](auto& event) {
+            const auto& rec = event->Get()->Record;
+            if (rec.GetStatus() == NKikimrIndexBuilder::ABORTED && rec.GetRetryAfterMs()) {
+                rejected.insert(rec.GetTabletId());
+            }
+        });
+        auto uploadObserver = runtime.AddObserver<TEvDataShard::TEvUploadRowsRequest>(
+            [&](auto&) { ++uploadRequests; });
+        using TSubmit = NResourceBroker::TEvResourceBroker::TEvSubmitTask;
+        TBlockEvents<TSubmit> submissions(runtime, [](const TSubmit::TPtr& ev) {
+            return ev->Get()->Task.Type == "build_index";
+        });
+        for (const ui64 shard : shards) {
+            auto request = MakeHolder<TEvDataShard::TEvReshuffleKMeansRequest>();
+            auto& rec = request->Record;
+            rec.SetAllowMemoryAdmission(GetTestParam("vector-upload-admission") == "true");
+            rec.SetId(1);
+            rec.SetSeqNoGeneration(1);
+            rec.SetSeqNoRound(1);
+            rec.SetTabletId(shard);
+            tableId.PathId.ToProto(rec.MutablePathId());
+            rec.SetSnapshotTxId(snapshot.TxId);
+            rec.SetSnapshotStep(snapshot.Step);
+            rec.MutableSettings()->set_vector_dimension(dimensions);
+            rec.MutableSettings()->set_vector_type(Ydb::Table::VectorIndexSettings::VECTOR_TYPE_UINT8);
+            rec.MutableSettings()->set_metric(Ydb::Table::VectorIndexSettings::DISTANCE_COSINE);
+            rec.SetUpload(NKikimrTxDataShard::UPLOAD_MAIN_TO_POSTING);
+            rec.SetParent(0);
+            rec.SetChild(1);
+            for (ui32 i = 0; i < count; ++i) {
+                if (distinctPayloads) {
+                    // Real network requests own their payload allocations. The
+                    // historical in-process case shares TString backing storage.
+                    rec.AddClusters(TString(centroid.data(), centroid.size()));
+                } else {
+                    rec.AddClusters(centroid);
+                }
+            }
+            rec.SetEmbeddingColumn("embedding");
+            rec.AddDataColumns("data");
+            rec.SetDatabaseName("/Root");
+            rec.SetOutputName("/Root/table-posting");
+            runtime.SendToPipe(shard, sender, request.Release(), 0, GetPipeConfigWithRetries());
+        }
+        runtime.WaitFor("all scans waiting for resource admission",
+            [&] { return submissions.size() + rejected.size() >= scans; }, TDuration::Seconds(30));
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(submissions.size() + rejected.size(), scans);
+        UNIT_ASSERT_VALUES_EQUAL(uploadRequests, 0);
+        if (admission) {
+            const auto usage = runtime.GetAppData().BuildIndexScanAdmission->GetUsage();
+            UNIT_ASSERT_VALUES_EQUAL(usage.Count, submissions.size());
+            UNIT_ASSERT_LE(usage.Bytes, 64_MB);
+            UNIT_ASSERT_LE(usage.Count, 128);
+        }
+        ui64 requestedMemory = 0;
+        for (const auto& ev : submissions) {
+            requestedMemory += ev->Get()->Task.RequiredResources[NKikimrResourceBroker::MEMORY];
+        }
+        Cerr << "VECTOR_CENTROID_MEMORY scans=" << scans << " dimensions=" << dimensions
+             << " clusters=" << count << " admitted=" << submissions.size() << " rejected=" << rejected.size()
+             << " requested_memory=" << requestedMemory
+             << " pending_bytes=" << runtime.GetAppData().BuildIndexScanAdmission->GetUsage().Bytes
+             << " distinct_payloads=" << distinctPayloads << Endl;
+        DumpUploadHeap("centroids-blocked");
+        submissions.Stop().Unblock();
+        THashSet<ui64> completed = rejected;
+        while (completed.size() < scans) {
+            const auto reply = runtime.GrabEdgeEventRethrow<TEvDataShard::TEvReshuffleKMeansResponse>(sender);
+            const auto& rec = reply->Get()->Record;
+            if (rec.GetStatus() == NKikimrIndexBuilder::ABORTED && rec.GetRetryAfterMs()) {
+                continue;
+            }
+            UNIT_ASSERT_VALUES_EQUAL_C(rec.GetStatus(), NKikimrIndexBuilder::DONE, rec.ShortDebugString());
+            UNIT_ASSERT(completed.insert(rec.GetTabletId()).second);
+            UNIT_ASSERT_VALUES_EQUAL(rec.GetMeteringStats().GetReadRows(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(rec.GetMeteringStats().GetUploadRows(), 0);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(uploadRequests, 0);
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        DumpUploadHeap("centroids-finished");
+    }
 }
 
 } // namespace NKikimr
